@@ -1,5 +1,5 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v4 SD CARD COMPATIBLE
+# SEIZURE MONITOR BACKEND - v7 SD QUEUE FIX
 #
 # PREVIOUS FIXES (v1):
 # 1. Jerk session not immediately closed by non-seizure device
@@ -22,27 +22,28 @@
 # [FIX F] ESP32 timestamp (ts_utc) for all session times
 #         Queued data from SD card now has accurate session timestamps
 #         matching the actual event time, not the upload time.
-#         - start_time: ts_utc (event time)
-#         - end_time: ts_utc (event time)
-#         - duration: now_utc delta (server time, reliable)
 #
 # DURATION-BASED CLASSIFICATION (v5):
 # [FIX G] Seizure type now determined by duration + device count:
 #         - 1 device seizing:   < 30s = Jerk, >= 30s = GTCS
 #         - 2+ devices seizing: < 15s = Jerk, >= 15s = GTCS
-#         Jerk sessions are auto-upgraded to GTCS when threshold is met.
 #
 # DURATION FIX (v6):
-# [FIX I] end_time now uses now_utc (server time) instead of ts_utc (ESP32 time)
-#         for both device_seizure_sessions and user_seizure_sessions.
-#         Root cause of same start/end time bug:
-#         - SD card buffered uploads arrive in a burst with near-identical timestamps.
-#         - ts_utc for all buffered rows ≈ same → start_time ≈ end_time → duration ≈ 0.
-#         - Server time (now_utc) reflects real elapsed time accurately.
-# [FIX J] /api/seizure_events/latest now prioritizes GTCS over Jerk when both
-#         have open sessions simultaneously.
-# [FIX K] duration_seconds added to /api/seizure_events/latest and /all responses.
-#         Computed in backend (server-side) for accuracy and consistency.
+# [FIX I] end_time now uses now_utc (server time) for user sessions
+#         start_time uses ts_utc (ESP32 time) for accuracy
+# [FIX J] /api/seizure_events/latest prioritizes GTCS over Jerk
+# [FIX K] duration_seconds added to responses
+#
+# SD QUEUE FIX (v7):
+# [FIX L] Device session close time uses ts_utc when ts_utc > start_time,
+#         falls back to now_utc otherwise.
+#         Root cause of fake long durations from SD card bursts:
+#         - ESP32 queues only 2 rows offline (flag=true, flag=false)
+#         - Backend was using now_utc (WiFi reconnect time) as end_time
+#         - start_time was ts_utc (actual event time) → huge fake duration
+#         - Fix: use ts_utc as end_time when it's a valid closing timestamp
+# [FIX M] STALE_SESSION_THRESHOLD_SECONDS lowered 120 → 45 seconds
+#         Shorter window catches orphaned sessions faster after disconnect
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -162,25 +163,18 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-# FIX A: Raised from 30 to 60 seconds
-# Render free tier has cold-start delays. 30s was too short —
-# a slow upload response made the device look disconnected even
-# when the ESP32 was physically still sending data.
+# [FIX A] Raised from 30 to 60 seconds — Render cold-start tolerance
 CONNECTED_THRESHOLD_SECONDS = 60
 
-# FIX B: Stale session threshold
-# Any open session older than this is considered orphaned
-# (ESP32 disconnected mid-seizure without sending a closing upload)
-STALE_SESSION_THRESHOLD_SECONDS = 120  # 2 minutes
+# [FIX M] Lowered from 120 to 45 seconds
+# Shorter stale window catches orphaned sessions faster after disconnect
+STALE_SESSION_THRESHOLD_SECONDS = 45
 
-# Minimum time a session must be open before it can be closed
 MIN_JERK_DURATION_SECONDS = 3
 MIN_GTCS_DURATION_SECONDS = 5
 
 # [FIX G] Duration-based classification thresholds
-# 1 device seizing:   seizure_duration >= this → upgrade Jerk to GTCS
 GTCS_THRESHOLD_1_DEVICE_SECONDS = 30
-# 2+ devices seizing: seizure_duration >= this → upgrade Jerk to GTCS
 GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15
 
 
@@ -263,19 +257,6 @@ async def get_active_user_seizure(user_id: int, seizure_type: str):
     )
 
 async def count_recent_seizure_readings(device_id: str, anchor_time: datetime, time_window_seconds: int = 5) -> int:
-    # Check if this device currently has an ACTIVE (open) seizure session.
-    # "Active" means device_seizure_sessions row with end_time=None for this device.
-    #
-    # WHY NOT a time window query on sensor_data:
-    # The old approach queried sensor_data for seizure_flag=True within ±5s of anchor.
-    # Problem: even after a device stops seizing and sends seizure_flag=False,
-    # the OLD seizure_flag=True rows are still in the DB and still fall inside
-    # the ±5s window → devices_with_seizure stays > 0 → session never closes.
-    #
-    # The device_seizure_sessions table is the source of truth:
-    # - When device sends seizure_flag=True  → a session row is opened (end_time=None)
-    # - When device sends seizure_flag=False → that session row is closed (end_time=now)
-    # So checking for an open session is exactly "is this device currently seizing?"
     active = await get_active_device_seizure(device_id)
     return 1 if active else 0
 
@@ -292,19 +273,9 @@ async def get_recent_seizure_data(device_ids: list, anchor_time: datetime, time_
         'device_seizure_counts': device_seizure_counts
     }
 
-# =====================================================================
-# FIX B + D: Stale session cleanup helper
-# Called on startup AND on every upload for the uploading device.
-# Closes any open sessions that are older than STALE_SESSION_THRESHOLD.
-# This handles:
-#   - ESP32 disconnecting mid-seizure (BLE drop, battery die, restart)
-#   - Backend restarting mid-seizure
-#   - Clock drift creating sessions that never get end_time
-# =====================================================================
 async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime):
     stale_cutoff = now_utc - timedelta(seconds=STALE_SESSION_THRESHOLD_SECONDS)
 
-    # Close stale device sessions
     for device_id in device_ids:
         stale_device_sessions = await database.fetch_all(
             device_seizure_sessions.select()
@@ -321,7 +292,6 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
                 .values(end_time=now_utc)
             )
 
-    # Close stale user sessions
     for stype in ["Jerk", "GTCS"]:
         stale_user_sessions = await database.fetch_all(
             user_seizure_sessions.select()
@@ -339,7 +309,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
                 .values(end_time=now_utc)
             )
 
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v2")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -352,7 +322,6 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     await database.connect()
-    # FIX D: Close any stale open sessions left over from before restart
     print("[STARTUP] Checking for stale open sessions...")
     now_utc = datetime.now(timezone.utc)
     stale_cutoff = now_utc - timedelta(seconds=STALE_SESSION_THRESHOLD_SECONDS)
@@ -395,7 +364,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v2"}
+    return {"message": "Backend running - MPU6050 Sensor v7"}
 
 @app.post("/api/register")
 async def register(u: UserCreate):
@@ -449,10 +418,8 @@ async def get_user_devices(current_user=Depends(get_current_user)):
         devices.select().where(devices.c.user_id == current_user["id"])
     )
     result = []
-    # FIX A: use 60s threshold
     cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=CONNECTED_THRESHOLD_SECONDS)
     for row in rows:
-        # FIX C: explicit ORDER BY + LIMIT 1 ensures index usage
         latest = await database.fetch_one(
             sensor_data.select()
             .where(sensor_data.c.device_id == row["device_id"])
@@ -488,7 +455,6 @@ async def get_user_devices(current_user=Depends(get_current_user)):
         })
     return result
 
-# FIX A + C: 60s threshold + optimized query
 @app.get("/api/mydevices_with_latest_data")
 async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
     user_devices = await database.fetch_all(
@@ -496,10 +462,8 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
     )
     output = []
     now = datetime.now(PHT)
-    # FIX A: 60s threshold
     cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=CONNECTED_THRESHOLD_SECONDS)
     for d in user_devices:
-        # FIX C: ORDER BY timestamp DESC LIMIT 1 — uses index
         latest = await database.fetch_one(
             sensor_data.select()
             .where(sensor_data.c.device_id == d["device_id"])
@@ -564,7 +528,6 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 
 @app.get("/api/seizure_events/latest")
 async def get_latest_event(current_user=Depends(get_current_user)):
-    # First: check for any active (open) session — prioritize GTCS over Jerk
     for stype in ["GTCS", "Jerk"]:
         row = await database.fetch_one(
             user_seizure_sessions.select()
@@ -584,7 +547,6 @@ async def get_latest_event(current_user=Depends(get_current_user)):
                 "end": ts_pht_iso(row["end_time"]) if row["end_time"] else None,
                 "duration_seconds": duration,
             }
-    # Fallback: return most recent closed session (any type)
     row = await database.fetch_one(
         user_seizure_sessions.select()
         .where(user_seizure_sessions.c.user_id == current_user["id"])
@@ -678,9 +640,9 @@ async def get_latest_seizure_event(current_user=Depends(get_current_user)):
     }
 
 # =====================================================================
-# ESP32 UPLOAD - v2 FIXED
-# FIX B: closes stale sessions before processing new upload
-# FIX (v1): time_window_seconds=8, continuous >= 1
+# ESP32 UPLOAD - v7 FIXED
+# [FIX L] Device session close time: use ts_utc when ts_utc > start_time
+#         (accurate for SD card queued events), else fall back to now_utc
 # =====================================================================
 @app.post("/api/device/upload")
 async def upload_device_data(payload: UnifiedESP32Payload):
@@ -693,7 +655,6 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     ts_utc = parse_esp32_timestamp(payload.timestamp_ms)
     print(f"[UPLOAD] device={payload.device_id} | seizure={payload.seizure_flag} | ts={to_pht(ts_utc).strftime('%H:%M:%S PHT')}")
 
-    # Save raw sensor data
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts_utc,
@@ -721,17 +682,13 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     device_ids = [d["device_id"] for d in user_devices]
     now_utc = datetime.now(timezone.utc)
 
-    # FIX B: Close any stale open sessions before processing this upload
-    # This runs quickly — only acts if stale sessions exist
     await close_stale_sessions(user_id, device_ids, now_utc)
 
-    # Per-device seizure session tracking
-    # FIX: Use ts_utc (ESP32 timestamp) for session times, not now_utc (server time)
-    # This ensures queued data from SD card has accurate session timestamps
-    # matching the actual event time, not the upload time.
+    # ── Device seizure session open/close ──
     active_device = await get_active_device_seizure(payload.device_id)
     if payload.seizure_flag:
         if not active_device:
+            # Open new session — use ts_utc (actual event time)
             await database.execute(
                 device_seizure_sessions.insert().values(
                     device_id=payload.device_id, start_time=ts_utc, end_time=None
@@ -739,55 +696,44 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             )
     else:
         if active_device:
-            # Use now_utc (server time) for end_time, NOT ts_utc (ESP32 time).
-            # SD card buffered uploads arrive in a burst with near-identical timestamps,
-            # so using ts_utc would make start_time ≈ end_time → duration ≈ 0.
+            # [FIX L] Use ts_utc as close time if it's after the session start.
+            # This gives accurate duration for SD card queued events:
+            #   - Row 1 (flag=true):  start_time = ts_utc of seizure start
+            #   - Row 2 (flag=false): end_time   = ts_utc of seizure end
+            # Both timestamps come from the ESP32 real-time clock,
+            # so the duration = actual seizure length, not WiFi reconnect lag.
+            #
+            # Fall back to now_utc only if ts_utc is somehow before start_time
+            # (e.g. clock drift or invalid timestamp)
+            if ts_utc > active_device["start_time"]:
+                close_time = ts_utc
+                print(f"[SESSION CLOSE] Using ts_utc: {to_pht(ts_utc).strftime('%H:%M:%S')} "
+                      f"(start={to_pht(active_device['start_time']).strftime('%H:%M:%S')})")
+            else:
+                close_time = now_utc
+                print(f"[SESSION CLOSE] ts_utc <= start_time, falling back to now_utc: "
+                      f"{to_pht(now_utc).strftime('%H:%M:%S')}")
+
             await database.execute(
                 device_seizure_sessions.update()
                 .where(device_seizure_sessions.c.id == active_device["id"])
-                .values(end_time=now_utc)
+                .values(end_time=close_time)
             )
 
-    # Now check how many devices currently have an ACTIVE open seizure session.
-    # This is checked AFTER the device session above is opened/closed,
-    # so the current device's state is already reflected in the DB.
-    # anchor_time param kept for backward compat but no longer used for window queries.
     seizure_data = await get_recent_seizure_data(device_ids, anchor_time=ts_utc, time_window_seconds=5)
     devices_with_seizure = seizure_data['devices_with_seizure']
     device_seizure_counts = seizure_data['device_seizure_counts']
 
     print(f"[DETECTION] user={user_id} | devices_with_seizure={devices_with_seizure}/{len(device_ids)} | counts={device_seizure_counts}")
 
-    # ------------------------------------------------------------------
-    # [FIX G] DURATION-BASED CLASSIFICATION (v5)
-    #
-    # The seizure TYPE is now determined by:
-    #   - How many devices are currently seizing (devices_with_seizure)
-    #   - How long the current seizure session has been active (duration)
-    #
-    # Rules:
-    #   1 device  seizing: < 30s = Jerk,  >= 30s = GTCS
-    #   2+ devices seizing: < 15s = Jerk, >= 15s = GTCS
-    #
-    # Flow:
-    #   - When seizure first detected → always open a Jerk session first
-    #   - On every subsequent upload → check duration against threshold
-    #   - If threshold met → close Jerk, open GTCS (escalate)
-    #   - If devices drop to 0 → close whatever is open
-    # ------------------------------------------------------------------
-
+    # ── User seizure session logic (duration-based classification) ──
     if devices_with_seizure >= 1:
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
 
-        # Determine which duration threshold applies
-        if devices_with_seizure >= 2:
-            gtcs_threshold = GTCS_THRESHOLD_MULTI_DEVICE_SECONDS
-        else:
-            gtcs_threshold = GTCS_THRESHOLD_1_DEVICE_SECONDS
+        gtcs_threshold = GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2 else GTCS_THRESHOLD_1_DEVICE_SECONDS
 
         if active_gtcs:
-            # Already in GTCS — just keep it open
             print(f"[GTCS] Active GTCS continuing (devices={devices_with_seizure})")
             return {"status": "saved", "event": "GTCS"}
 
@@ -796,35 +742,26 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             print(f"[JERK] Active Jerk duration={jerk_duration:.1f}s | threshold={gtcs_threshold}s | devices={devices_with_seizure}")
 
             if jerk_duration >= gtcs_threshold:
-                # Duration threshold met — escalate Jerk → GTCS
-                # Instead of closing Jerk + inserting a new GTCS row,
-                # UPDATE the existing Jerk row: change type to "GTCS", keep start_time.
-                # Result: app shows ONE event (GTCS) with the original Jerk start time,
-                # not two separate Jerk + GTCS entries.
                 print(f"[JERK->GTCS] Escalating: duration={jerk_duration:.1f}s >= {gtcs_threshold}s with {devices_with_seizure} device(s)")
                 print(f"[GTCS] *** STARTING GTCS SESSION for user {user_id} (converted from Jerk id={active_jerk['id']}, keeping start_time) ***")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(type="GTCS")  # Keep same row + same start_time, just change type
+                    .values(type="GTCS")
                 )
                 return {"status": "saved", "event": "GTCS"}
             else:
-                # Still within Jerk window
                 print(f"[JERK] Keeping Jerk open (id={active_jerk['id']}), not yet at threshold")
                 return {"status": "saved", "event": "Jerk"}
 
         else:
-            # No active session — start a new Jerk session
             print(f"[JERK] *** STARTING JERK SESSION for user {user_id} (devices={devices_with_seizure}) ***")
             await database.execute(user_seizure_sessions.insert().values(
                 user_id=user_id, type="Jerk", start_time=ts_utc, end_time=None
             ))
             return {"status": "saved", "event": "Jerk"}
 
-    # ------------------------------------------------------------------
-    # CASE: NO SEIZURE - close any open sessions if minimum duration met
-    # ------------------------------------------------------------------
+    # ── No seizure — close open sessions if minimum duration met ──
     if devices_with_seizure == 0:
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         if active_gtcs:
@@ -834,7 +771,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_gtcs["id"])
-                    .values(end_time=now_utc)  # server time for accurate duration
+                    .values(end_time=now_utc)
                 )
             else:
                 print(f"[GTCS] Keeping GTCS open (duration={gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s)")
@@ -847,7 +784,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=now_utc)  # server time for accurate duration
+                    .values(end_time=now_utc)
                 )
             else:
                 print(f"[JERK] Keeping Jerk open (duration={jerk_duration:.1f}s < min {MIN_JERK_DURATION_SECONDS}s)")
