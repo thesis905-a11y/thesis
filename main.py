@@ -926,15 +926,64 @@ async def admin_get_user_events(user_id: int, current_user=Depends(get_current_u
         .where(user_seizure_sessions.c.user_id == user_id)
         .order_by(user_seizure_sessions.c.start_time.desc())
     )
-    return [
-        {
+
+    # Get all device_ids belonging to this user
+    user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
+    user_device_ids = [d["device_id"] for d in user_devices]
+
+    result = []
+    for r in rows:
+        start_utc = r["start_time"]
+        end_utc = r["end_time"]
+
+        # Find which devices had sensor data flagged during this event window
+        q = sensor_data.select().where(
+            and_(
+                sensor_data.c.device_id.in_(user_device_ids),
+                sensor_data.c.timestamp >= start_utc,
+            )
+        )
+        if end_utc:
+            q = q.where(sensor_data.c.timestamp <= end_utc)
+        q = q.where(sensor_data.c.seizure_flag == True)
+
+        seizing_rows = await database.fetch_all(q)
+        # Deduplicate device ids, preserve order
+        seen = {}
+        for sd in seizing_rows:
+            did = sd["device_id"]
+            if did not in seen:
+                seen[did] = True
+        seizing_device_ids = list(seen.keys())
+
+        # If no seizure_flag rows found, fall back to any sensor data in window
+        if not seizing_device_ids:
+            q2 = sensor_data.select().where(
+                and_(
+                    sensor_data.c.device_id.in_(user_device_ids),
+                    sensor_data.c.timestamp >= start_utc,
+                )
+            )
+            if end_utc:
+                q2 = q2.where(sensor_data.c.timestamp <= end_utc)
+            fallback_rows = await database.fetch_all(q2)
+            for sd in fallback_rows:
+                did = sd["device_id"]
+                if did not in seen:
+                    seen[did] = True
+            seizing_device_ids = list(seen.keys())
+
+        result.append({
             "type": r["type"],
             "start": ts_pht_iso(r["start_time"]),
             "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None,
             "duration_seconds": compute_duration(r),
-        }
-        for r in rows
-    ]
+            # Primary device (first seizing device, or empty string)
+            "device_id": seizing_device_ids[0] if seizing_device_ids else "",
+            # All involved devices
+            "device_ids": seizing_device_ids,
+        })
+    return result
 
 @app.get("/api/admin/user/{user_id}/events/{start}/data")
 async def get_event_sensor_data(
@@ -959,6 +1008,7 @@ async def get_event_sensor_data(
     return [
         {
             "timestamp": ts_pht_iso(r["timestamp"]),
+            "device_id": r["device_id"],
             "accel_x": r["accel_x"], "accel_y": r["accel_y"], "accel_z": r["accel_z"],
             "gyro_x": r["gyro_x"], "gyro_y": r["gyro_y"], "gyro_z": r["gyro_z"],
             "battery_percent": r["battery_percent"],
