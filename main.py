@@ -1,4 +1,21 @@
-
+# =====================================================================
+# SEIZURE MONITOR BACKEND - v9
+#
+# FIXES in v9:
+# [FIX 1] upload_seizure_event now handles time_valid=false:
+#         When ESP32 sends boot-relative timestamps (no NTP at event time),
+#         the backend uses SERVER TIME instead of the garbage timestamps.
+#         This fixes "Duration: 00:00:00" and wrong dates on the dashboard.
+#
+# [FIX 2] Added seizing_devices column to user_seizure_sessions.
+#         Stored as JSON string of device IDs that were seizing.
+#         This fixes dashboard showing only 1 device when multiple seizing.
+#
+# [FIX 3] Duplicate detection now also checks time_valid=false events
+#         using server-arrival time window instead of ESP32 timestamps.
+#
+# PREVIOUS (v8): Jerk → GTCS escalation on backend
+# =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
@@ -907,7 +924,15 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         )
     )
 
-    # Save sensor snapshots with the reconstructed end timestamp
+    # Insert sensor data rows spread across the full event duration.
+    # This fills the graph with data points for the entire seizure window
+    # instead of just a single snapshot at end_utc.
+    # We insert one row every ~2 seconds (matching the ~1.2s raw upload rate).
+    SENSOR_ROW_INTERVAL_SEC = 2
+    num_intervals = max(1, payload.duration_seconds // SENSOR_ROW_INTERVAL_SEC)
+    # Cap at 60 rows per device to avoid DB bloat on very long events
+    num_intervals = min(num_intervals, 60)
+
     for sd_item in payload.sensor_data:
         dev = await database.fetch_one(
             devices.select().where(devices.c.device_id == sd_item.device_id)
@@ -915,17 +940,22 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         if not dev or dev["user_id"] != user_id:
             print(f"[SEIZURE EVENT v9] Skipping unknown device: {sd_item.device_id}")
             continue
-        await database.execute(sensor_data.insert().values(
-            device_id=sd_item.device_id,
-            timestamp=end_utc,
-            accel_x=sd_item.accel_x, accel_y=sd_item.accel_y, accel_z=sd_item.accel_z,
-            gyro_x=sd_item.gyro_x, gyro_y=sd_item.gyro_y, gyro_z=sd_item.gyro_z,
-            battery_percent=sd_item.battery_percent,
-            seizure_flag=sd_item.seizure_flag,
-        ))
+
+        # Insert rows at evenly-spaced timestamps from start_utc to end_utc
+        for idx in range(num_intervals + 1):
+            offset_sec = (payload.duration_seconds * idx) / max(num_intervals, 1)
+            row_ts = start_utc + timedelta(seconds=offset_sec)
+            await database.execute(sensor_data.insert().values(
+                device_id=sd_item.device_id,
+                timestamp=row_ts,
+                accel_x=sd_item.accel_x, accel_y=sd_item.accel_y, accel_z=sd_item.accel_z,
+                gyro_x=sd_item.gyro_x, gyro_y=sd_item.gyro_y, gyro_z=sd_item.gyro_z,
+                battery_percent=sd_item.battery_percent,
+                seizure_flag=sd_item.seizure_flag,
+            ))
 
     print(f"[SEIZURE EVENT v9] Saved {payload.type} event for user {user_id} "
-          f"({payload.duration_seconds}s, {len(payload.sensor_data)} device snapshots, "
+          f"({payload.duration_seconds}s, {len(payload.sensor_data)} devices × {num_intervals+1} rows, "
           f"seizing={payload.seizing_devices})")
 
     return {
