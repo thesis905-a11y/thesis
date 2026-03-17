@@ -925,15 +925,13 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     )
 
     # Insert sensor data rows spread across the full event duration.
-    # This fills the graph with data points for the entire seizure window
-    # instead of just a single snapshot at end_utc.
-    # We insert one row every ~2 seconds (matching the ~1.2s raw upload rate).
+    # Each device gets its OWN set of timestamps (offset by 0.5s per device)
+    # so their rows don't share timestamps — this prevents zigzag on the graph.
     SENSOR_ROW_INTERVAL_SEC = 2
     num_intervals = max(1, payload.duration_seconds // SENSOR_ROW_INTERVAL_SEC)
-    # Cap at 60 rows per device to avoid DB bloat on very long events
-    num_intervals = min(num_intervals, 60)
+    num_intervals = min(num_intervals, 60)  # cap at 60 rows per device
 
-    for sd_item in payload.sensor_data:
+    for dev_idx, sd_item in enumerate(payload.sensor_data):
         dev = await database.fetch_one(
             devices.select().where(devices.c.device_id == sd_item.device_id)
         )
@@ -941,10 +939,13 @@ async def upload_seizure_event(payload: SeizureEventPayload):
             print(f"[SEIZURE EVENT v9] Skipping unknown device: {sd_item.device_id}")
             continue
 
-        # Insert rows at evenly-spaced timestamps from start_utc to end_utc
+        # Each device is offset by 0.5s so their rows don't share the same timestamp,
+        # preventing the zigzag effect when multiple devices are graphed together.
+        device_offset = timedelta(milliseconds=500 * dev_idx)
+
         for idx in range(num_intervals + 1):
             offset_sec = (payload.duration_seconds * idx) / max(num_intervals, 1)
-            row_ts = start_utc + timedelta(seconds=offset_sec)
+            row_ts = start_utc + timedelta(seconds=offset_sec) + device_offset
             await database.execute(sensor_data.insert().values(
                 device_id=sd_item.device_id,
                 timestamp=row_ts,
