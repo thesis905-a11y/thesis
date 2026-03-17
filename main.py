@@ -196,15 +196,30 @@ class SeizureDeviceSensorData(BaseModel):
     battery_percent: int
     seizure_flag: bool
 
+class SeizureWindowReading(BaseModel):
+    ax: float
+    ay: float
+    az: float
+    gx: float
+    gy: float
+    gz: float
+    bp: int
+
+class SeizureWindowDevice(BaseModel):
+    device_id: str
+    seizure_flag: bool
+    readings: List[SeizureWindowReading]
+
 class SeizureEventPayload(BaseModel):
     type: str
     start_time_ut: int
     end_time_ut: int
     duration_seconds: int
-    time_valid: Optional[bool] = True   # v9: false = boot-relative timestamps, use server time
+    time_valid: Optional[bool] = True
     device_ids: List[str]
     seizing_devices: List[str]
     sensor_data: List[SeizureDeviceSensorData]
+    window_data: Optional[List[SeizureWindowDevice]] = None  # full 10-reading window per device
 
 
 # =====================================================================
@@ -924,40 +939,73 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         )
     )
 
-    # Insert sensor data rows spread across the full event duration.
-    # Each device gets its OWN set of timestamps (offset by 0.5s per device)
-    # so their rows don't share timestamps — this prevents zigzag on the graph.
-    SENSOR_ROW_INTERVAL_SEC = 2
-    num_intervals = max(1, payload.duration_seconds // SENSOR_ROW_INTERVAL_SEC)
-    num_intervals = min(num_intervals, 60)  # cap at 60 rows per device
+    # Build sensor rows to insert.
+    # If window_data is present (v20+ firmware), use the 10 actual varied readings
+    # per device — these produce a natural-looking graph instead of zigzag/flat lines.
+    # Fall back to snapshot-based repeated rows for older firmware.
 
-    for dev_idx, sd_item in enumerate(payload.sensor_data):
-        dev = await database.fetch_one(
-            devices.select().where(devices.c.device_id == sd_item.device_id)
-        )
-        if not dev or dev["user_id"] != user_id:
-            print(f"[SEIZURE EVENT v9] Skipping unknown device: {sd_item.device_id}")
-            continue
+    if payload.window_data:
+        # v20+ path: use actual varied window readings
+        for dev_idx, wd in enumerate(payload.window_data):
+            dev = await database.fetch_one(
+                devices.select().where(devices.c.device_id == wd.device_id)
+            )
+            if not dev or dev["user_id"] != user_id:
+                print(f"[SEIZURE EVENT] Skipping unknown device: {wd.device_id}")
+                continue
 
-        # Each device is offset by 0.5s so their rows don't share the same timestamp,
-        # preventing the zigzag effect when multiple devices are graphed together.
-        device_offset = timedelta(milliseconds=500 * dev_idx)
+            num_readings = len(wd.readings)
+            if num_readings == 0:
+                continue
 
-        for idx in range(num_intervals + 1):
-            offset_sec = (payload.duration_seconds * idx) / max(num_intervals, 1)
-            row_ts = start_utc + timedelta(seconds=offset_sec) + device_offset
-            await database.execute(sensor_data.insert().values(
-                device_id=sd_item.device_id,
-                timestamp=row_ts,
-                accel_x=sd_item.accel_x, accel_y=sd_item.accel_y, accel_z=sd_item.accel_z,
-                gyro_x=sd_item.gyro_x, gyro_y=sd_item.gyro_y, gyro_z=sd_item.gyro_z,
-                battery_percent=sd_item.battery_percent,
-                seizure_flag=sd_item.seizure_flag,
-            ))
+            # Spread the window readings evenly across the full event duration
+            device_offset = timedelta(milliseconds=200 * dev_idx)  # small offset per device
+            for idx, reading in enumerate(wd.readings):
+                offset_sec = (payload.duration_seconds * idx) / max(num_readings - 1, 1)
+                row_ts = start_utc + timedelta(seconds=offset_sec) + device_offset
+                await database.execute(sensor_data.insert().values(
+                    device_id=wd.device_id,
+                    timestamp=row_ts,
+                    accel_x=reading.ax, accel_y=reading.ay, accel_z=reading.az,
+                    gyro_x=reading.gx, gyro_y=reading.gy, gyro_z=reading.gz,
+                    battery_percent=reading.bp,
+                    seizure_flag=wd.seizure_flag,
+                ))
 
-    print(f"[SEIZURE EVENT v9] Saved {payload.type} event for user {user_id} "
-          f"({payload.duration_seconds}s, {len(payload.sensor_data)} devices × {num_intervals+1} rows, "
-          f"seizing={payload.seizing_devices})")
+        print(f"[SEIZURE EVENT] Saved {payload.type} for user {user_id} "
+              f"({payload.duration_seconds}s, window_data: {len(payload.window_data)} devices, "
+              f"seizing={payload.seizing_devices})")
+
+    else:
+        # Legacy path (older firmware): repeat snapshot rows across duration
+        SENSOR_ROW_INTERVAL_SEC = 2
+        num_intervals = max(1, payload.duration_seconds // SENSOR_ROW_INTERVAL_SEC)
+        num_intervals = min(num_intervals, 60)
+
+        for dev_idx, sd_item in enumerate(payload.sensor_data):
+            dev = await database.fetch_one(
+                devices.select().where(devices.c.device_id == sd_item.device_id)
+            )
+            if not dev or dev["user_id"] != user_id:
+                print(f"[SEIZURE EVENT] Skipping unknown device: {sd_item.device_id}")
+                continue
+
+            device_offset = timedelta(milliseconds=500 * dev_idx)
+            for idx in range(num_intervals + 1):
+                offset_sec = (payload.duration_seconds * idx) / max(num_intervals, 1)
+                row_ts = start_utc + timedelta(seconds=offset_sec) + device_offset
+                await database.execute(sensor_data.insert().values(
+                    device_id=sd_item.device_id,
+                    timestamp=row_ts,
+                    accel_x=sd_item.accel_x, accel_y=sd_item.accel_y, accel_z=sd_item.accel_z,
+                    gyro_x=sd_item.gyro_x, gyro_y=sd_item.gyro_y, gyro_z=sd_item.gyro_z,
+                    battery_percent=sd_item.battery_percent,
+                    seizure_flag=sd_item.seizure_flag,
+                ))
+
+        print(f"[SEIZURE EVENT] Saved {payload.type} for user {user_id} "
+              f"({payload.duration_seconds}s, legacy snapshot × {num_intervals+1} rows, "
+              f"seizing={payload.seizing_devices})")
 
     return {
         "status": "saved",
