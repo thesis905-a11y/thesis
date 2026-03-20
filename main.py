@@ -1,7 +1,18 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v10
+# SEIZURE MONITOR BACKEND - v10.1
 #
-# CHANGES in v10 (mirrors ESP32 firmware v16):
+# CHANGES in v10.1 (mirrors ESP32 firmware v16.1):
+#
+# [FIX 1] Jerk -> GTCS escalation no longer creates duplicate history entries.
+#   Old: opened Jerk row, then closed it + opened new GTCS row -> 2 entries.
+#   New: UPDATE the existing Jerk row's type to "GTCS" in-place -> 1 entry.
+#   History now shows GTCS only (not Jerk + GTCS).
+#
+# [FIX 2] Pure Jerk events are capped at 10s.
+#   If a Jerk session somehow closes with duration > 10s without the
+#   escalation type-update having fired, it is saved as GTCS instead.
+#
+# ORIGINAL v10 CHANGES (mirrors ESP32 firmware v16):
 #
 # [CHANGE 1] JERK is now SEPARATE from GTCS.
 #   - Jerk still requires all 3 devices moving (detected via seizure_flag).
@@ -320,7 +331,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v10")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v10.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -385,7 +396,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v10"}
+    return {"message": "Backend running - MPU6050 Sensor v10.1"}
 
 
 # =====================================================================
@@ -800,17 +811,27 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     # ---------------------------------------------------------------
     # PATH A — JERK: all 3 devices seizing simultaneously
-    # Jerk session escalates to GTCS after 10s
+    # Jerk session escalates to GTCS after 10s.
+    #
+    # KEY FIX v10.1:
+    #   We NEVER save a separate "Jerk" DB row that later becomes
+    #   a separate "GTCS" row — that caused duplicate entries in history.
+    #   Instead:
+    #   - We open a "Jerk" session row immediately (so we track start time).
+    #   - On escalation: UPDATE the SAME row's type to "GTCS" in-place.
+    #     History then shows ONE entry that is "GTCS", not "Jerk" + "GTCS".
+    #   - If devices stop before 10s: the row stays as "Jerk" and is closed.
     # ---------------------------------------------------------------
     if devices_seizing_now >= 3:
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
 
         if active_gtcs:
-            print(f"[JERK/GTCS] Active GTCS continuing (escalated)")
+            print(f"[JERK/GTCS] Active GTCS continuing (escalated from Jerk)")
             return {"status": "saved", "event": "GTCS"}
 
         if not active_jerk:
+            # Open a Jerk session to track the start time.
             print(f"[JERK] *** OPENING JERK SESSION for user {user_id} (all 3 devices seizing) ***")
             await database.execute(user_seizure_sessions.insert().values(
                 user_id=user_id,
@@ -823,19 +844,16 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         else:
             jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
             if jerk_duration >= JERK_GTCS_ESCALATION_SECONDS:
-                print(f"[JERK->GTCS] *** ESCALATING Jerk to GTCS (dur={jerk_duration:.1f}s >= {JERK_GTCS_ESCALATION_SECONDS}s) ***")
+                # ESCALATE: UPDATE the existing Jerk row type to "GTCS" in-place.
+                # This means history shows ONE event (started as Jerk, became GTCS)
+                # NOT two separate Jerk + GTCS entries.
+                print(f"[JERK->GTCS] *** ESCALATING: updating Jerk id={active_jerk['id']} type->GTCS "
+                      f"(dur={jerk_duration:.1f}s >= {JERK_GTCS_ESCALATION_SECONDS}s) ***")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=now_utc)
+                    .values(type="GTCS", seizing_devices=json.dumps(device_ids))
                 )
-                await database.execute(user_seizure_sessions.insert().values(
-                    user_id=user_id,
-                    type="GTCS",
-                    start_time=active_jerk["start_time"],
-                    end_time=None,
-                    seizing_devices=json.dumps(device_ids)
-                ))
                 return {"status": "saved", "event": "GTCS"}
             else:
                 print(f"[JERK] Active Jerk continuing (id={active_jerk['id']}, dur={jerk_duration:.1f}s/{JERK_GTCS_ESCALATION_SECONDS}s)")
@@ -916,12 +934,21 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     if active_jerk:
         jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
         if jerk_duration >= MIN_JERK_DURATION_SECONDS:
-            print(f"[JERK] Closing Jerk (dur={jerk_duration:.1f}s)")
-            await database.execute(
-                user_seizure_sessions.update()
-                .where(user_seizure_sessions.c.id == active_jerk["id"])
-                .values(end_time=now_utc)
-            )
+            if jerk_duration > JERK_GTCS_ESCALATION_SECONDS:
+                # Ran past 10s without being escalated (edge case) — save as GTCS
+                print(f"[JERK] Closing Jerk that exceeded 10s as GTCS (dur={jerk_duration:.1f}s)")
+                await database.execute(
+                    user_seizure_sessions.update()
+                    .where(user_seizure_sessions.c.id == active_jerk["id"])
+                    .values(type="GTCS", end_time=now_utc)
+                )
+            else:
+                print(f"[JERK] Closing Jerk (dur={jerk_duration:.1f}s)")
+                await database.execute(
+                    user_seizure_sessions.update()
+                    .where(user_seizure_sessions.c.id == active_jerk["id"])
+                    .values(end_time=now_utc)
+                )
         else:
             print(f"[JERK] Keeping open (dur={jerk_duration:.1f}s < min {MIN_JERK_DURATION_SECONDS}s)")
 
