@@ -1,16 +1,3 @@
-# =====================================================================
-# SEIZURE MONITOR BACKEND - v8 JERK → GTCS ESCALATION
-#
-# NEW in v8:
-# [FIX M] Jerk sessions that reach GTCS_THRESHOLD_MULTI_DEVICE_SECONDS
-#         (15s) now escalate to GTCS on the backend.
-#         - The open Jerk session is closed.
-#         - A new GTCS session is opened, keeping the original Jerk
-#           start_time so duration is accurate from first motion.
-#         - Alarm/dashboard updates to show GTCS immediately.
-#
-# PREVIOUS FIXES (v1–v7): see below
-# =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
@@ -127,6 +114,7 @@ user_seizure_sessions = sqlalchemy.Table(
     sqlalchemy.Column("start_time", sqlalchemy.DateTime(timezone=True)),
     sqlalchemy.Column("end_time", sqlalchemy.DateTime(timezone=True), nullable=True),
     sqlalchemy.Column("duration_seconds", sqlalchemy.Integer, nullable=True),
+    sqlalchemy.Column("seizing_devices", sqlalchemy.Text, nullable=True),  # JSON array string
 )
 
 metadata.create_all(engine)
@@ -138,10 +126,19 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
 CONNECTED_THRESHOLD_SECONDS = 60
 STALE_SESSION_THRESHOLD_SECONDS = 120
-MIN_JERK_DURATION_SECONDS = 3
-MIN_GTCS_DURATION_SECONDS = 5
-GTCS_THRESHOLD_1_DEVICE_SECONDS = 20
-GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15
+MIN_JERK_DURATION_SECONDS = 1   # min duration to save a Jerk event (avoid phantom saves)
+MIN_GTCS_DURATION_SECONDS = 5   # min duration to save a GTCS event
+
+# GTCS thresholds (Path B - per device, no grouping)
+GTCS_THRESHOLD_1_DEVICE_SECONDS    = 20  # 1 device alone needs 20s of motion
+GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15  # 2+ devices moving need only 15s
+
+# Jerk thresholds (Path A - requires all 3 devices within grouping window)
+# The grouping window check happens on the ESP32 side.
+# The backend sees seizure_flag=true from a device and tracks per-device sessions.
+# When all 3 devices have active sessions (all flagging seizure) -> Jerk confirmed.
+# Backend holds Jerk open while any device keeps flagging; closes when all stop.
+JERK_ESCALATE_TO_GTCS_SECONDS = 15  # if Jerk session runs >= 15s -> escalate to GTCS
 
 
 # =====================================================================
@@ -190,14 +187,30 @@ class SeizureDeviceSensorData(BaseModel):
     battery_percent: int
     seizure_flag: bool
 
+class SeizureWindowReading(BaseModel):
+    ax: float
+    ay: float
+    az: float
+    gx: float
+    gy: float
+    gz: float
+    bp: int
+
+class SeizureWindowDevice(BaseModel):
+    device_id: str
+    seizure_flag: bool
+    readings: List[SeizureWindowReading]
+
 class SeizureEventPayload(BaseModel):
     type: str
     start_time_ut: int
     end_time_ut: int
     duration_seconds: int
+    time_valid: Optional[bool] = True
     device_ids: List[str]
     seizing_devices: List[str]
     sensor_data: List[SeizureDeviceSensorData]
+    window_data: Optional[List[SeizureWindowDevice]] = None
 
 
 # =====================================================================
@@ -249,23 +262,6 @@ async def get_active_user_seizure(user_id: int, seizure_type: str):
         .order_by(user_seizure_sessions.c.start_time.desc())
     )
 
-async def count_recent_seizure_readings(device_id: str, anchor_time: datetime, time_window_seconds: int = 5) -> int:
-    active = await get_active_device_seizure(device_id)
-    return 1 if active else 0
-
-async def get_recent_seizure_data(device_ids: list, anchor_time: datetime, time_window_seconds: int = 5):
-    devices_with_seizure = 0
-    device_seizure_counts = {}
-    for device_id in device_ids:
-        count = await count_recent_seizure_readings(device_id, anchor_time, time_window_seconds)
-        device_seizure_counts[device_id] = count
-        if count > 0:
-            devices_with_seizure += 1
-    return {
-        'devices_with_seizure': devices_with_seizure,
-        'device_seizure_counts': device_seizure_counts
-    }
-
 async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime):
     stale_cutoff = now_utc - timedelta(seconds=STALE_SESSION_THRESHOLD_SECONDS)
     for device_id in device_ids:
@@ -302,7 +298,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v8")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v10")
 
 app.add_middleware(
     CORSMiddleware,
@@ -315,11 +311,16 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     await database.connect()
-    try:
-        await database.execute("ALTER TABLE user_seizure_sessions ADD COLUMN duration_seconds INTEGER")
-        print("[STARTUP] Added duration_seconds column")
-    except Exception as e:
-        print(f"[STARTUP] duration_seconds column already exists (ok): {type(e).__name__}")
+
+    for col_sql, col_name in [
+        ("ALTER TABLE user_seizure_sessions ADD COLUMN duration_seconds INTEGER", "duration_seconds"),
+        ("ALTER TABLE user_seizure_sessions ADD COLUMN seizing_devices TEXT", "seizing_devices"),
+    ]:
+        try:
+            await database.execute(col_sql)
+            print(f"[STARTUP] Added column: {col_name}")
+        except Exception as e:
+            print(f"[STARTUP] Column '{col_name}' already exists (ok): {type(e).__name__}")
 
     print("[STARTUP] Checking for stale open sessions...")
     now_utc = datetime.now(timezone.utc)
@@ -362,7 +363,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v8"}
+    return {"message": "Backend running - MPU6050 Sensor v10"}
 
 
 # =====================================================================
@@ -534,7 +535,7 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 
 
 # =====================================================================
-# SEIZURE EVENTS — READ ENDPOINTS
+# SEIZURE EVENTS - READ ENDPOINTS
 # =====================================================================
 def compute_duration(row) -> Optional[int]:
     stored = row["duration_seconds"] if "duration_seconds" in row.keys() else None
@@ -543,6 +544,15 @@ def compute_duration(row) -> Optional[int]:
     if row["end_time"] and row["start_time"]:
         return int((row["end_time"] - row["start_time"]).total_seconds())
     return None
+
+def parse_seizing_devices(row) -> List[str]:
+    try:
+        val = row["seizing_devices"] if "seizing_devices" in row.keys() else None
+        if val:
+            return json.loads(val)
+    except Exception:
+        pass
+    return []
 
 @app.get("/api/seizure_events/latest")
 async def get_latest_event(current_user=Depends(get_current_user)):
@@ -561,6 +571,7 @@ async def get_latest_event(current_user=Depends(get_current_user)):
                 "start": ts_pht_iso(row["start_time"]),
                 "end": ts_pht_iso(row["end_time"]) if row["end_time"] else None,
                 "duration_seconds": compute_duration(row),
+                "seizing_devices": parse_seizing_devices(row),
             }
     row = await database.fetch_one(
         user_seizure_sessions.select()
@@ -575,6 +586,7 @@ async def get_latest_event(current_user=Depends(get_current_user)):
         "start": ts_pht_iso(row["start_time"]),
         "end": ts_pht_iso(row["end_time"]) if row["end_time"] else None,
         "duration_seconds": compute_duration(row),
+        "seizing_devices": parse_seizing_devices(row),
     }
 
 @app.get("/api/seizure_events/all")
@@ -590,6 +602,7 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
             "start": ts_pht_iso(r["start_time"]),
             "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None,
             "duration_seconds": compute_duration(r),
+            "seizing_devices": parse_seizing_devices(r),
         }
         for r in rows
     ]
@@ -603,12 +616,13 @@ async def download_seizure_events(current_user=Depends(get_current_user)):
     )
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Type", "Start Time (PHT)", "End Time (PHT)", "Duration (seconds)"])
+    writer.writerow(["Type", "Start Time (PHT)", "End Time (PHT)", "Duration (seconds)", "Seizing Devices"])
     for r in rows:
         start = ts_pht_iso(r["start_time"])
         end = ts_pht_iso(r["end_time"]) if r["end_time"] else "Ongoing"
         duration = compute_duration(r) or ""
-        writer.writerow([r["type"], start, end, duration])
+        seizing = ", ".join(parse_seizing_devices(r))
+        writer.writerow([r["type"], start, end, duration, seizing])
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
@@ -628,6 +642,7 @@ async def get_seizure_events(current_user=Depends(get_current_user)):
             "type": r["type"],
             "start": ts_pht_iso(r["start_time"]),
             "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None,
+            "seizing_devices": parse_seizing_devices(r),
         }
         for r in rows
     ]
@@ -647,11 +662,27 @@ async def get_latest_seizure_event(current_user=Depends(get_current_user)):
         "start_time": ts_pht_iso(row["start_time"]),
         "end_time": ts_pht_iso(row["end_time"]),
         "duration_seconds": compute_duration(row),
+        "seizing_devices": parse_seizing_devices(row),
     }
 
 
 # =====================================================================
-# ESP32 UPLOAD — raw sensor reading
+# ESP32 UPLOAD - raw sensor reading
+#
+# Detection logic (mirrors ESP32 v16):
+#
+# PATH A - JERK
+#   Requires ALL 3 user devices to have active device_seizure_sessions
+#   simultaneously (the ESP32 only sets seizure_flag=true when it detects
+#   jerk-motion, so all 3 flagging = all 3 jolted within the window).
+#   - If all 3 devices active + no open Jerk session -> open Jerk
+#   - If Jerk session running >= JERK_ESCALATE_TO_GTCS_SECONDS -> escalate to GTCS
+#   - If fewer than 3 devices active -> close any open Jerk session
+#
+# PATH B - GTCS
+#   Per-device independent timer using device_seizure_sessions.
+#   1 device active >= 20s OR 2+ devices active >= 15s -> open GTCS session.
+#   Completely independent from Path A.
 # =====================================================================
 @app.post("/api/device/upload")
 async def upload_device_data(payload: UnifiedESP32Payload):
@@ -693,6 +724,9 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     await close_stale_sessions(user_id, device_ids, now_utc)
 
+    # ---------------------------------------------------------------
+    # Update per-device seizure session (used by both Path A and B)
+    # ---------------------------------------------------------------
     active_device = await get_active_device_seizure(payload.device_id)
     if payload.seizure_flag:
         if not active_device:
@@ -701,6 +735,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                     device_id=payload.device_id, start_time=ts_utc, end_time=None
                 )
             )
+            active_device = await get_active_device_seizure(payload.device_id)
     else:
         if active_device:
             await database.execute(
@@ -708,134 +743,137 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 .where(device_seizure_sessions.c.id == active_device["id"])
                 .values(end_time=now_utc)
             )
+            active_device = None
 
-    seizure_data = await get_recent_seizure_data(device_ids, anchor_time=ts_utc, time_window_seconds=5)
-    devices_with_seizure = seizure_data['devices_with_seizure']
-    device_seizure_counts = seizure_data['device_seizure_counts']
+    # Count how many of the user's devices currently have open seizure sessions
+    active_device_sessions = []
+    for did in device_ids:
+        ds = await get_active_device_seizure(did)
+        if ds:
+            active_device_sessions.append(ds)
 
-    print(f"[DETECTION] user={user_id} | devices_with_seizure={devices_with_seizure}/{len(device_ids)} | counts={device_seizure_counts}")
+    devices_with_seizure = len(active_device_sessions)
+    print(f"[DETECTION] user={user_id} | devices_with_seizure={devices_with_seizure}/{len(device_ids)}")
 
-    # ==============================================================
-    # PATH A — JERK (all 3 devices moving)
-    # NEW v8: After 15s still all-3 moving → escalate Jerk to GTCS
-    # ==============================================================
+    # ==================================================================
+    # PATH A - JERK (all 3 devices must be actively flagging)
+    # ==================================================================
     if devices_with_seizure >= 3:
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
 
-        # If GTCS already open (from a previous escalation), keep it going
+        # If already escalated to GTCS, just keep it going
         if active_gtcs:
-            print(f"[GTCS] Active GTCS continuing after Jerk escalation (id={active_gtcs['id']})")
+            print(f"[GTCS] Continuing escalated GTCS (from Jerk)")
             return {"status": "saved", "event": "GTCS"}
 
         if not active_jerk:
-            # Start a fresh Jerk session
-            print(f"[JERK] *** STARTING JERK SESSION for user {user_id} (all 3 devices moving) ***")
+            # All 3 devices are flagging - open a new Jerk session
+            earliest_start = min(ds["start_time"] for ds in active_device_sessions)
+            print(f"[JERK] *** NEW SESSION — all {devices_with_seizure}/3 devices flagging ***")
             await database.execute(user_seizure_sessions.insert().values(
-                user_id=user_id, type="Jerk", start_time=ts_utc, end_time=None
+                user_id=user_id,
+                type="Jerk",
+                start_time=earliest_start,  # use earliest device session start
+                end_time=None,
+                seizing_devices=json.dumps(device_ids)
             ))
             return {"status": "saved", "event": "Jerk"}
+
         else:
-            # Jerk session is already open — check if it should escalate to GTCS
+            # Jerk session already open - check for escalation
             jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
-            if jerk_duration >= GTCS_THRESHOLD_MULTI_DEVICE_SECONDS:
-                # -------------------------------------------------------
-                # NEW v8: JERK → GTCS ESCALATION
-                # Close the Jerk session, open GTCS from the same start time
-                # so the total duration (Jerk + GTCS) is accurate.
-                # -------------------------------------------------------
-                print(f"[JERK→GTCS] *** ESCALATING Jerk to GTCS (duration={jerk_duration:.1f}s >= {GTCS_THRESHOLD_MULTI_DEVICE_SECONDS}s, all 3 devices) ***")
+            if jerk_duration >= JERK_ESCALATE_TO_GTCS_SECONDS:
+                print(f"[JERK->GTCS] *** ESCALATING — Jerk ran {jerk_duration:.1f}s >= {JERK_ESCALATE_TO_GTCS_SECONDS}s ***")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
                     .values(end_time=now_utc)
                 )
-                # Open GTCS using the original Jerk start_time (accurate from first motion)
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id,
                     type="GTCS",
-                    start_time=active_jerk["start_time"],  # keep original start
-                    end_time=None
+                    start_time=active_jerk["start_time"],  # GTCS starts from when Jerk started
+                    end_time=None,
+                    seizing_devices=json.dumps(device_ids)
                 ))
                 return {"status": "saved", "event": "GTCS"}
             else:
-                print(f"[JERK] Active Jerk continuing (id={active_jerk['id']}, dur={jerk_duration:.1f}s / {GTCS_THRESHOLD_MULTI_DEVICE_SECONDS}s)")
+                print(f"[JERK] Session continuing (dur={jerk_duration:.1f}s / {JERK_ESCALATE_TO_GTCS_SECONDS}s)")
                 return {"status": "saved", "event": "Jerk"}
 
-    # ==============================================================
-    # PATH B — GTCS (independent, for 1–2 device scenarios)
-    # ==============================================================
-    if devices_with_seizure >= 1:
-        gtcs_threshold = GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2 else GTCS_THRESHOLD_1_DEVICE_SECONDS
-        active_gtcs = await get_active_user_seizure(user_id, "GTCS")
-        active_jerk = await get_active_user_seizure(user_id, "Jerk")
+    # If fewer than 3 devices are flagging, close any open Jerk session
+    # (Jerk REQUIRES all 3; if one stops, the Jerk event ends)
+    active_jerk = await get_active_user_seizure(user_id, "Jerk")
+    if active_jerk and devices_with_seizure < 3:
+        jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
+        if jerk_duration >= MIN_JERK_DURATION_SECONDS:
+            print(f"[JERK] Closing — only {devices_with_seizure}/3 devices flagging (dur={jerk_duration:.1f}s)")
+            await database.execute(
+                user_seizure_sessions.update()
+                .where(user_seizure_sessions.c.id == active_jerk["id"])
+                .values(end_time=now_utc)
+            )
+        else:
+            print(f"[JERK] Keeping open — dur={jerk_duration:.1f}s < min {MIN_JERK_DURATION_SECONDS}s")
 
+    # ==================================================================
+    # PATH B - GTCS (per-device independent, no grouping)
+    # Uses the same device_seizure_sessions but with its own time threshold.
+    # Only applies when NOT all-3-devices (which is handled by Path A above).
+    # ==================================================================
+    if devices_with_seizure >= 1:
+        gtcs_threshold = (
+            GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2
+            else GTCS_THRESHOLD_1_DEVICE_SECONDS
+        )
+
+        active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         if active_gtcs:
-            print(f"[GTCS] Active GTCS continuing (devices={devices_with_seizure})")
+            print(f"[GTCS] Continuing (devices={devices_with_seizure})")
             return {"status": "saved", "event": "GTCS"}
 
-        oldest_device_session = None
-        for did in device_ids:
-            ds = await get_active_device_seizure(did)
-            if ds:
-                if oldest_device_session is None or ds["start_time"] < oldest_device_session["start_time"]:
-                    oldest_device_session = ds
+        # Find the oldest active device session to measure motion duration
+        oldest_session = min(active_device_sessions, key=lambda s: s["start_time"])
+        motion_duration = (now_utc - oldest_session["start_time"]).total_seconds()
+        seizing_device_ids = [ds["device_id"] for ds in active_device_sessions]
 
-        if oldest_device_session:
-            motion_duration = (now_utc - oldest_device_session["start_time"]).total_seconds()
-            print(f"[GTCS] Motion duration={motion_duration:.1f}s | threshold={gtcs_threshold}s | devices={devices_with_seizure}")
-            if motion_duration >= gtcs_threshold:
-                if active_jerk:
-                    await database.execute(
-                        user_seizure_sessions.update()
-                        .where(user_seizure_sessions.c.id == active_jerk["id"])
-                        .values(end_time=now_utc)
-                    )
-                print(f"[GTCS] *** DIRECT GTCS TRIGGERED (motion={motion_duration:.1f}s >= {gtcs_threshold}s, devices={devices_with_seizure}) ***")
-                await database.execute(user_seizure_sessions.insert().values(
-                    user_id=user_id, type="GTCS",
-                    start_time=oldest_device_session["start_time"], end_time=None
-                ))
-                return {"status": "saved", "event": "GTCS"}
-            else:
-                print(f"[GTCS] Timer running — not yet (motion={motion_duration:.1f}s < {gtcs_threshold}s)")
+        print(f"[GTCS] motion={motion_duration:.1f}s / threshold={gtcs_threshold}s | devices={devices_with_seizure}")
+
+        if motion_duration >= gtcs_threshold:
+            print(f"[GTCS] *** TRIGGERED (motion={motion_duration:.1f}s >= {gtcs_threshold}s, devices={devices_with_seizure}) ***")
+            await database.execute(user_seizure_sessions.insert().values(
+                user_id=user_id,
+                type="GTCS",
+                start_time=oldest_session["start_time"],
+                end_time=None,
+                seizing_devices=json.dumps(seizing_device_ids)
+            ))
+            return {"status": "saved", "event": "GTCS"}
+
         return {"status": "saved", "event": "none"}
 
-    # ==============================================================
-    # NO SEIZURE — close any open sessions
-    # ==============================================================
-    if devices_with_seizure == 0:
-        active_gtcs = await get_active_user_seizure(user_id, "GTCS")
-        if active_gtcs:
-            gtcs_duration = (now_utc - active_gtcs["start_time"]).total_seconds()
-            if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
-                print(f"[GTCS] Closing GTCS (duration={gtcs_duration:.1f}s)")
-                await database.execute(
-                    user_seizure_sessions.update()
-                    .where(user_seizure_sessions.c.id == active_gtcs["id"])
-                    .values(end_time=now_utc)
-                )
-            else:
-                print(f"[GTCS] Keeping GTCS open (duration={gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s)")
-
-        active_jerk = await get_active_user_seizure(user_id, "Jerk")
-        if active_jerk:
-            jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
-            if jerk_duration >= MIN_JERK_DURATION_SECONDS:
-                print(f"[JERK] Closing Jerk (duration={jerk_duration:.1f}s)")
-                await database.execute(
-                    user_seizure_sessions.update()
-                    .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=now_utc)
-                )
-            else:
-                print(f"[JERK] Keeping Jerk open (duration={jerk_duration:.1f}s < min {MIN_JERK_DURATION_SECONDS}s)")
+    # ==================================================================
+    # NO SEIZURE - close any open sessions
+    # ==================================================================
+    active_gtcs = await get_active_user_seizure(user_id, "GTCS")
+    if active_gtcs:
+        gtcs_duration = (now_utc - active_gtcs["start_time"]).total_seconds()
+        if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
+            print(f"[GTCS] Closing (dur={gtcs_duration:.1f}s)")
+            await database.execute(
+                user_seizure_sessions.update()
+                .where(user_seizure_sessions.c.id == active_gtcs["id"])
+                .values(end_time=now_utc)
+            )
+        else:
+            print(f"[GTCS] Keeping open — dur={gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s")
 
     return {"status": "saved", "event": "none"}
 
 
 # =====================================================================
-# NEW ENDPOINT: POST /api/device/upload_seizure_event
+# ESP32 UPLOAD - seizure event (from SD card queue)
 # =====================================================================
 @app.post("/api/device/upload_seizure_event")
 async def upload_seizure_event(payload: SeizureEventPayload):
@@ -849,16 +887,22 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         raise HTTPException(status_code=404, detail=f"Device {payload.device_ids[0]} not registered")
     user_id = first_device["user_id"]
 
+    time_valid = payload.time_valid if payload.time_valid is not None else True
+
+    if not time_valid:
+        print(f"[SEIZURE EVENT v10] REJECTED — time_valid=False (boot-relative timestamps).")
+        return {"status": "rejected", "reason": "boot_relative_timestamps_not_accepted"}
+
     start_utc = parse_unix_seconds(payload.start_time_ut)
     end_utc   = parse_unix_seconds(payload.end_time_ut)
-
-    print(f"[SEIZURE EVENT] user={user_id} type={payload.type} "
+    print(f"[SEIZURE EVENT v10] user={user_id} type={payload.type} "
           f"start={to_pht(start_utc).strftime('%Y-%m-%d %H:%M:%S PHT')} "
           f"end={to_pht(end_utc).strftime('%H:%M:%S PHT')} "
           f"dur={payload.duration_seconds}s "
           f"devices={payload.device_ids} seizing={payload.seizing_devices}")
 
-    tolerance = timedelta(seconds=10)
+    # Duplicate detection
+    tolerance = timedelta(seconds=30)
     existing_session = await database.fetch_one(
         user_seizure_sessions.select()
         .where(user_seizure_sessions.c.user_id == user_id)
@@ -867,8 +911,10 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         .where(user_seizure_sessions.c.start_time <= start_utc + tolerance)
     )
     if existing_session:
-        print(f"[SEIZURE EVENT] Duplicate detected (id={existing_session['id']}) — skipping")
+        print(f"[SEIZURE EVENT v10] Duplicate detected (id={existing_session['id']}) — skipping")
         return {"status": "duplicate", "event": payload.type}
+
+    seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
 
     await database.execute(
         user_seizure_sessions.insert().values(
@@ -877,27 +923,65 @@ async def upload_seizure_event(payload: SeizureEventPayload):
             start_time=start_utc,
             end_time=end_utc,
             duration_seconds=payload.duration_seconds,
+            seizing_devices=seizing_json,
         )
     )
 
-    for sd_item in payload.sensor_data:
-        dev = await database.fetch_one(
-            devices.select().where(devices.c.device_id == sd_item.device_id)
-        )
-        if not dev or dev["user_id"] != user_id:
-            print(f"[SEIZURE EVENT] Skipping unknown device: {sd_item.device_id}")
-            continue
-        await database.execute(sensor_data.insert().values(
-            device_id=sd_item.device_id,
-            timestamp=end_utc,
-            accel_x=sd_item.accel_x, accel_y=sd_item.accel_y, accel_z=sd_item.accel_z,
-            gyro_x=sd_item.gyro_x, gyro_y=sd_item.gyro_y, gyro_z=sd_item.gyro_z,
-            battery_percent=sd_item.battery_percent,
-            seizure_flag=sd_item.seizure_flag,
-        ))
+    if payload.window_data:
+        for dev_idx, wd in enumerate(payload.window_data):
+            dev = await database.fetch_one(
+                devices.select().where(devices.c.device_id == wd.device_id)
+            )
+            if not dev or dev["user_id"] != user_id:
+                print(f"[SEIZURE EVENT] Skipping unknown device: {wd.device_id}")
+                continue
 
-    print(f"[SEIZURE EVENT] Saved {payload.type} event for user {user_id} "
-          f"({payload.duration_seconds}s, {len(payload.sensor_data)} device snapshots)")
+            num_readings = len(wd.readings)
+            if num_readings == 0:
+                continue
+
+            device_offset = timedelta(milliseconds=200 * dev_idx)
+            for idx, reading in enumerate(wd.readings):
+                offset_sec = (payload.duration_seconds * idx) / max(num_readings - 1, 1)
+                row_ts = start_utc + timedelta(seconds=offset_sec) + device_offset
+                await database.execute(sensor_data.insert().values(
+                    device_id=wd.device_id,
+                    timestamp=row_ts,
+                    accel_x=reading.ax, accel_y=reading.ay, accel_z=reading.az,
+                    gyro_x=reading.gx, gyro_y=reading.gy, gyro_z=reading.gz,
+                    battery_percent=reading.bp,
+                    seizure_flag=wd.seizure_flag,
+                ))
+
+        print(f"[SEIZURE EVENT] Saved {payload.type} (window_data: {len(payload.window_data)} devices)")
+
+    else:
+        SENSOR_ROW_INTERVAL_SEC = 2
+        num_intervals = max(1, payload.duration_seconds // SENSOR_ROW_INTERVAL_SEC)
+        num_intervals = min(num_intervals, 60)
+
+        for dev_idx, sd_item in enumerate(payload.sensor_data):
+            dev = await database.fetch_one(
+                devices.select().where(devices.c.device_id == sd_item.device_id)
+            )
+            if not dev or dev["user_id"] != user_id:
+                print(f"[SEIZURE EVENT] Skipping unknown device: {sd_item.device_id}")
+                continue
+
+            device_offset = timedelta(milliseconds=500 * dev_idx)
+            for idx in range(num_intervals + 1):
+                offset_sec = (payload.duration_seconds * idx) / max(num_intervals, 1)
+                row_ts = start_utc + timedelta(seconds=offset_sec) + device_offset
+                await database.execute(sensor_data.insert().values(
+                    device_id=sd_item.device_id,
+                    timestamp=row_ts,
+                    accel_x=sd_item.accel_x, accel_y=sd_item.accel_y, accel_z=sd_item.accel_z,
+                    gyro_x=sd_item.gyro_x, gyro_y=sd_item.gyro_y, gyro_z=sd_item.gyro_z,
+                    battery_percent=sd_item.battery_percent,
+                    seizure_flag=sd_item.seizure_flag,
+                ))
+
+        print(f"[SEIZURE EVENT] Saved {payload.type} (legacy snapshot x{num_intervals+1} rows)")
 
     return {
         "status": "saved",
@@ -905,6 +989,8 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         "duration_seconds": payload.duration_seconds,
         "start_pht": ts_pht_iso(start_utc),
         "end_pht": ts_pht_iso(end_utc),
+        "seizing_devices": payload.seizing_devices,
+        "time_valid": time_valid,
     }
 
 
@@ -938,36 +1024,23 @@ async def admin_get_user_events(user_id: int, current_user=Depends(get_current_u
 
     result = []
     for r in rows:
-        start_utc = r["start_time"]
-        end_utc = r["end_time"]
-        q = sensor_data.select().where(
-            and_(
-                sensor_data.c.device_id.in_(user_device_ids),
-                sensor_data.c.timestamp >= start_utc,
-            )
-        )
-        if end_utc:
-            q = q.where(sensor_data.c.timestamp <= end_utc)
-        q = q.where(sensor_data.c.seizure_flag == True)
-        seizing_rows = await database.fetch_all(q)
-        seen = {}
-        for sd in seizing_rows:
-            did = sd["device_id"]
-            if did not in seen:
-                seen[did] = True
-        seizing_device_ids = list(seen.keys())
+        seizing_device_ids = parse_seizing_devices(r)
 
         if not seizing_device_ids:
-            q2 = sensor_data.select().where(
+            start_utc = r["start_time"]
+            end_utc = r["end_time"]
+            q = sensor_data.select().where(
                 and_(
                     sensor_data.c.device_id.in_(user_device_ids),
                     sensor_data.c.timestamp >= start_utc,
                 )
             )
             if end_utc:
-                q2 = q2.where(sensor_data.c.timestamp <= end_utc)
-            fallback_rows = await database.fetch_all(q2)
-            for sd in fallback_rows:
+                q = q.where(sensor_data.c.timestamp <= end_utc)
+            q = q.where(sensor_data.c.seizure_flag == True)
+            seizing_rows = await database.fetch_all(q)
+            seen = {}
+            for sd in seizing_rows:
                 did = sd["device_id"]
                 if did not in seen:
                     seen[did] = True
