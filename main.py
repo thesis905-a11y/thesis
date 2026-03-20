@@ -1,25 +1,24 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v12
+# SEIZURE MONITOR BACKEND - v13
 #
-# FIX in v12:
-# [FIX] GTCS session now closes properly after devices stop seizing.
+# FIX in v13:
+# [FIX] GTCS session now closes correctly when devices stop seizing.
 #
-#       ROOT CAUSE of the bug:
-#       - GTCS session (id=135) stayed open for 1+ minute after all
-#         devices returned seizure=False
-#       - The session close logic only ran when timer=None (expired),
-#         but the sticky timer was still alive in its idle window,
-#         so the "close" block was never reached
-#       - Result: "Active GTCS session continuing" forever
+#       ROOT CAUSE (still present in v12):
+#       - The "Active GTCS session continuing" branch hit `return` BEFORE
+#         reaching the idle-timeout close check added in v12
+#       - So the close check at the bottom was NEVER reached while an
+#         active GTCS session existed
 #
 #       THE FIX:
-#       - Added a second close check inside the timer-still-alive branch:
-#         if an open GTCS session exists AND idle_since >= GTCS_IDLE_TIMEOUT,
-#         close the session immediately with duration + end_time
-#       - Also added duration_seconds to all close operations so the
-#         dashboard always shows the correct duration
+#       - Moved idle-timeout close check INTO the active_gtcs branch,
+#         BEFORE the return statement
+#       - If idle_since >= GTCS_IDLE_TIMEOUT_SECONDS (8s): close + return none
+#       - If idle_since < threshold: keep open + return GTCS (as before)
+#       - Works even when timer was already cleared (timer=None) by using
+#         the sensor_data window as fallback for idle detection
 #
-# PREVIOUS (v11): sticky GTCS timer + jerk race condition fix
+# PREVIOUS (v12): added close check below active_gtcs (wrong placement)
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -466,7 +465,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v12")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v13")
 
 app.add_middleware(
     CORSMiddleware,
@@ -531,7 +530,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v12"}
+    return {"message": "Backend running - MPU6050 Sensor v13"}
 
 
 # =====================================================================
@@ -942,15 +941,59 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     # ==================================================================
     # PATH B — GTCS STICKY TIMER
-    # Any device seizing → start/refresh timer.
-    # Timer survives brief pauses (sticky up to GTCS_IDLE_TIMEOUT_SECONDS).
-    # When elapsed >= GTCS_TRIGGER_SECONDS → GTCS.
     # ==================================================================
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
     if active_gtcs:
-        print(f"[GTCS] Active GTCS session continuing (id={active_gtcs['id']})")
-        clear_gtcs_timer(user_id)
-        return {"status": "saved", "event": "GTCS"}
+        # Check if we should CLOSE this session (idle timeout reached)
+        timer = _gtcs_timers.get(user_id)
+        now_for_idle = now_utc
+
+        # Determine idle time: use timer's last_active if available,
+        # else fall back to checking the sensor_data window directly
+        if timer is not None:
+            idle_since = (now_for_idle - timer["last_active"]).total_seconds()
+        else:
+            # Timer was cleared (e.g. after trigger) — use window check
+            # If no device has been active in GTCS_IDLE_TIMEOUT_SECONDS, close it
+            window_start = now_for_idle - timedelta(seconds=GTCS_IDLE_TIMEOUT_SECONDS)
+            any_recent = False
+            for device_id in device_ids:
+                if device_id == payload.device_id:
+                    if payload.seizure_flag:
+                        any_recent = True
+                        break
+                else:
+                    recent = await database.fetch_one(
+                        sensor_data.select()
+                        .where(sensor_data.c.device_id == device_id)
+                        .where(sensor_data.c.timestamp >= window_start)
+                        .where(sensor_data.c.seizure_flag == True)
+                        .order_by(sensor_data.c.timestamp.desc())
+                        .limit(1)
+                    )
+                    if recent:
+                        any_recent = True
+                        break
+            # If current upload is also False and nothing recent → idle
+            idle_since = 0 if any_recent else (GTCS_IDLE_TIMEOUT_SECONDS + 1)
+
+        if idle_since >= GTCS_IDLE_TIMEOUT_SECONDS:
+            gtcs_duration = (now_for_idle - active_gtcs["start_time"]).total_seconds()
+            if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
+                print(f"[GTCS] *** CLOSING GTCS (idle={idle_since:.1f}s >= {GTCS_IDLE_TIMEOUT_SECONDS}s, "
+                      f"duration={gtcs_duration:.1f}s) ***")
+                await database.execute(
+                    user_seizure_sessions.update()
+                    .where(user_seizure_sessions.c.id == active_gtcs["id"])
+                    .values(end_time=now_for_idle,
+                            duration_seconds=int(gtcs_duration))
+                )
+                clear_gtcs_timer(user_id)
+                return {"status": "saved", "event": "none"}
+        else:
+            print(f"[GTCS] Active GTCS continuing (id={active_gtcs['id']}, idle={idle_since:.1f}s)")
+            clear_gtcs_timer(user_id)
+            return {"status": "saved", "event": "GTCS"}
 
     should_trigger, elapsed = await update_gtcs_sticky_timer(
         user_id, device_ids, now_utc, payload.device_id, payload.seizure_flag
