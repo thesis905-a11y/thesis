@@ -784,7 +784,10 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     # ---------------------------------------------------------------
     # Count devices with an active timer:
-    # = currently seizing OR stopped recently within gap tolerance
+    # = currently seizing OR stopped recently within gap tolerance.
+    # Used ONLY for threshold selection (1-device vs multi-device).
+    # Does NOT keep existing GTCS session alive — that is handled
+    # separately by devices_seizing_now.
     # ---------------------------------------------------------------
     gap_cutoff = now_utc - timedelta(seconds=GTCS_GAP_TOLERANCE_SECONDS)
     devices_with_active_timer = 0
@@ -864,8 +867,14 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     #
     # If any device's open session duration >= threshold -> GTCS.
     # Threshold depends on how many devices have active timers.
+    # Gap bridge: devices_with_active_timer counts recently stopped
+    # devices (within 5s) to set the multi-device threshold correctly.
+    #
+    # KEY: active GTCS session only stays alive if seizing_now > 0.
+    # When seizing_now == 0, fall through to NO MOTION close block
+    # regardless of gap bridge count. This prevents bloated durations.
     # ---------------------------------------------------------------
-    if devices_with_active_timer >= 1:
+    if devices_with_active_timer >= 1 and devices_seizing_now > 0:
         gtcs_threshold = (GTCS_THRESHOLD_MULTI_DEVICE_SECONDS
                           if devices_with_active_timer >= 2
                           else GTCS_THRESHOLD_1_DEVICE_SECONDS)
@@ -874,7 +883,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
 
         if active_gtcs:
-            print(f"[GTCS] Active GTCS continuing (timer_active={devices_with_active_timer})")
+            print(f"[GTCS] Active GTCS continuing (seizing_now={devices_seizing_now}, timer_active={devices_with_active_timer})")
             return {"status": "saved", "event": "GTCS"}
 
         # Find the device with the longest cumulative motion
@@ -915,7 +924,10 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         return {"status": "saved", "event": "none"}
 
     # ---------------------------------------------------------------
-    # NO MOTION — close open sessions
+    # NO MOTION — devices_seizing_now == 0 AND devices_with_active_timer == 0
+    # Close any open sessions.
+    # NOTE: We close based on devices_seizing_now == 0, NOT timer_active.
+    # Gap bridge only affects threshold selection for new GTCS triggers.
     # ---------------------------------------------------------------
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
     if active_gtcs:
@@ -935,7 +947,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
         if jerk_duration >= MIN_JERK_DURATION_SECONDS:
             if jerk_duration > JERK_GTCS_ESCALATION_SECONDS:
-                # Ran past 10s without being escalated (edge case) — save as GTCS
+                # Ran past 10s without escalation flag (edge case) — save as GTCS
                 print(f"[JERK] Closing Jerk that exceeded 10s as GTCS (dur={jerk_duration:.1f}s)")
                 await database.execute(
                     user_seizure_sessions.update()
