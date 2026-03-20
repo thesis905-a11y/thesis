@@ -1,34 +1,25 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v11
+# SEIZURE MONITOR BACKEND - v12
 #
-# FIXES in v11:
+# FIX in v12:
+# [FIX] GTCS session now closes properly after devices stop seizing.
 #
-# [FIX 1] jerk_window race condition:
-#         v10 called get_jerk_window_seizure_data() BEFORE the current
-#         device's INSERT was committed to the DB — so the current upload's
-#         seizure_flag=True was never counted in the window.
-#         Fix: include payload.seizure_flag in the window count manually
-#         by always crediting the current uploading device if seizure=True.
+#       ROOT CAUSE of the bug:
+#       - GTCS session (id=135) stayed open for 1+ minute after all
+#         devices returned seizure=False
+#       - The session close logic only ran when timer=None (expired),
+#         but the sticky timer was still alive in its idle window,
+#         so the "close" block was never reached
+#       - Result: "Active GTCS session continuing" forever
 #
-# [FIX 2] GTCS sticky timer — "any device within 15s" rule:
-#         Old behavior: timer reset to 0 when a device stopped seizing.
-#         New behavior: timer is per-user, not per-device. Once ANY device
-#         starts seizing, a user-level GTCS timer starts. It does NOT reset
-#         when one device stops — it only resets when ALL devices have been
-#         quiet for GTCS_IDLE_TIMEOUT_SECONDS (8s). If any device seizes
-#         again within that idle window, the timer keeps running.
-#         This means: "if any seizing has happened within 15s, trigger GTCS"
-#         regardless of which device it was or whether it's still seizing.
+#       THE FIX:
+#       - Added a second close check inside the timer-still-alive branch:
+#         if an open GTCS session exists AND idle_since >= GTCS_IDLE_TIMEOUT,
+#         close the session immediately with duration + end_time
+#       - Also added duration_seconds to all close operations so the
+#         dashboard always shows the correct duration
 #
-#         New table column: user_gtcs_timer tracks per-user GTCS timer state
-#         (stored in memory dict — no schema change needed).
-#
-# [FIX 3] Path B GTCS threshold simplified:
-#         Removed the 1-device=20s / 2-device=15s split.
-#         Now: any device seizing → 15s sticky timer → GTCS.
-#         Rationale: user asked "kahit 1 device basta may kasunod within 15s"
-#
-# PREVIOUS (v10): time-window Jerk detection
+# PREVIOUS (v11): sticky GTCS timer + jerk race condition fix
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -475,7 +466,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v11")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v12")
 
 app.add_middleware(
     CORSMiddleware,
@@ -540,7 +531,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v11"}
+    return {"message": "Backend running - MPU6050 Sensor v12"}
 
 
 # =====================================================================
@@ -998,23 +989,45 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         if active_gtcs2:
             gtcs_duration = (now_utc - active_gtcs2["start_time"]).total_seconds()
             if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
-                print(f"[GTCS] Closing GTCS (duration={gtcs_duration:.1f}s)")
+                print(f"[GTCS] Closing GTCS — timer expired (duration={gtcs_duration:.1f}s)")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_gtcs2["id"])
-                    .values(end_time=now_utc)
+                    .values(end_time=now_utc,
+                            duration_seconds=int(gtcs_duration))
                 )
 
         active_jerk2 = await get_active_user_seizure(user_id, "Jerk")
         if active_jerk2:
             jerk_duration = (now_utc - active_jerk2["start_time"]).total_seconds()
             if jerk_duration >= MIN_JERK_DURATION_SECONDS:
-                print(f"[JERK] Closing Jerk (duration={jerk_duration:.1f}s)")
+                print(f"[JERK] Closing Jerk — timer expired (duration={jerk_duration:.1f}s)")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk2["id"])
-                    .values(end_time=now_utc)
+                    .values(end_time=now_utc,
+                            duration_seconds=int(jerk_duration))
                 )
+    else:
+        # Timer still in sticky/idle window — but check if the open GTCS session
+        # has been sitting with no activity longer than the idle timeout.
+        # This handles the case where GTCS was triggered but devices stopped
+        # before the timer expired, leaving an open session with no close signal.
+        active_gtcs3 = await get_active_user_seizure(user_id, "GTCS")
+        if active_gtcs3:
+            idle_since = (now_utc - timer["last_active"]).total_seconds()
+            if idle_since >= GTCS_IDLE_TIMEOUT_SECONDS:
+                gtcs_duration = (now_utc - active_gtcs3["start_time"]).total_seconds()
+                if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
+                    print(f"[GTCS] Closing GTCS — idle timeout reached "
+                          f"(idle={idle_since:.1f}s, duration={gtcs_duration:.1f}s)")
+                    await database.execute(
+                        user_seizure_sessions.update()
+                        .where(user_seizure_sessions.c.id == active_gtcs3["id"])
+                        .values(end_time=now_utc,
+                                duration_seconds=int(gtcs_duration))
+                    )
+                    clear_gtcs_timer(user_id)
 
     return {"status": "saved", "event": "none"}
 
