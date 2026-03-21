@@ -200,12 +200,23 @@ RECENT_GTCS_SUPPRESS_JERK_SECONDS   = 60
 
 # =====================================================================
 # IN-MEMORY STATE
+#
+# WHY IN-MEMORY FOR MOTION TIMING (not DB-based):
+# The gap between uploads from the same device is ~5s (1.2s interval
+# × 3 devices + server processing). Any DB gap tolerance that works
+# for chaining (>5s) would also count old False readings as True.
+# In-memory tracking is immune to this — exactly like ESP32 does it.
 # =====================================================================
-# user_id → datetime when GTCS threshold was first crossed (trigger time)
-# Duration = last_true_upload_time - trigger_time
-_gtcs_trigger_time: dict   = {}
 
-# user_id → datetime until new Jerk session is suppressed
+# device_id → datetime when this device's current motion bout started.
+# Set on first True upload. Cleared on False upload.
+_device_motion_start: dict = {}
+
+# user_id → datetime when GTCS threshold was first triggered.
+# Duration = last True upload time - trigger time.
+_gtcs_trigger_time: dict = {}
+
+# user_id → datetime until new Jerk session is suppressed.
 _jerk_suppress_until: dict = {}
 
 
@@ -907,6 +918,20 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     devices_with_seizure = len(currently_seizing)
     print(f"[DETECTION] user={user_id} | seizing_now={devices_with_seizure}/{len(device_ids)} | devices={currently_seizing}")
 
+    # ----------------------------------------------------------------
+    # Update in-memory motion start time for this device.
+    # True upload → record start if not set. False upload → clear it.
+    # This is the key fix: motion duration accumulates across upload
+    # cycles without being reset by timing gaps between device batches.
+    # ----------------------------------------------------------------
+    if payload.seizure_flag:
+        if payload.device_id not in _device_motion_start:
+            _device_motion_start[payload.device_id] = now_utc
+            print(f"[MOTION] {payload.device_id} started at {to_pht(now_utc).strftime('%H:%M:%S')}")
+    else:
+        if payload.device_id in _device_motion_start:
+            del _device_motion_start[payload.device_id]
+
     active_jerk = await get_active_user_seizure(user_id, "Jerk")
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
 
@@ -948,9 +973,9 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         else:
             _jerk_suppress_until.pop(user_id, None)
             if not await get_recent_completed_gtcs(user_id, now_utc):
-                # Find earliest motion start across seizing devices
-                starts = [await get_motion_start_time(did, now_utc) for did in currently_seizing]
-                jerk_start = min(starts) if starts else ts_utc
+                # Use in-memory motion starts
+                starts = [_device_motion_start[did] for did in currently_seizing if did in _device_motion_start]
+                jerk_start = min(starts) if starts else now_utc
                 print(f"[JERK] NEW SESSION start={to_pht(jerk_start).strftime('%H:%M:%S PHT')}")
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id, type="Jerk",
@@ -963,28 +988,36 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     # ================================================================
     # GTCS PATH B — sustained motion from 1+ devices
+    #
+    # Uses IN-MEMORY motion start per device (_device_motion_start).
+    # motion_start = when device first uploaded True this bout.
+    # motion_duration = now - motion_start — accumulates correctly
+    # across upload cycles, never reset by timing gaps.
     # ================================================================
     if devices_with_seizure >= 1:
         if active_gtcs:
-            # Motion still present — keep GTCS open
             print(f"[GTCS] Continuing (id={active_gtcs['id']}, seizing={devices_with_seizure})")
             return {"status": "saved", "event": "GTCS"}
 
-        # No open GTCS — check if motion has lasted long enough to trigger one
         gtcs_threshold = (GTCS_THRESHOLD_MULTI_DEVICE_SECONDS
                           if devices_with_seizure >= 2
                           else GTCS_THRESHOLD_1_DEVICE_SECONDS)
 
-        # Find when motion started (earliest continuous True bout)
-        starts = [await get_motion_start_time(did, now_utc) for did in currently_seizing]
-        motion_start = min(starts) if starts else now_utc
+        # In-memory motion starts — reliable regardless of upload timing
+        starts = [_device_motion_start[did] for did in currently_seizing if did in _device_motion_start]
+        if not starts:
+            # No in-memory record (server restarted?) — can't trigger yet
+            print(f"[GTCS] No motion start recorded yet — waiting")
+            return {"status": "saved", "event": "none"}
+
+        motion_start = min(starts)
         motion_duration = (now_utc - motion_start).total_seconds()
 
         print(f"[GTCS] motion={motion_duration:.1f}s | threshold={gtcs_threshold}s | seizing={devices_with_seizure}")
 
         if motion_duration >= gtcs_threshold:
             print(f"[GTCS] *** TRIGGERED ***")
-            _gtcs_trigger_time[user_id] = now_utc  # record trigger moment
+            _gtcs_trigger_time[user_id] = now_utc
             await database.execute(user_seizure_sessions.insert().values(
                 user_id=user_id, type="GTCS",
                 start_time=motion_start, end_time=None,
@@ -995,31 +1028,25 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         return {"status": "saved", "event": "none"}
 
     # ================================================================
-    # devices_with_seizure == 0 — no motion right now
-    #
-    # KEY: Close GTCS IMMEDIATELY (no grace, no window delay).
-    # Duration = trigger_time → last True upload timestamp in DB.
+    # devices_with_seizure == 0 — motion stopped
+    # Close GTCS immediately. Duration = trigger → last True upload.
     # ================================================================
     if active_gtcs:
-        # Find the actual last moment motion was detected
         last_true_time = await get_last_true_upload_time(device_ids, now_utc)
         trigger_time   = _gtcs_trigger_time.pop(user_id, None)
 
         if trigger_time and last_true_time and last_true_time > trigger_time:
-            # Exact duration: from when GTCS triggered to last True reading
             gtcs_duration = (last_true_time - trigger_time).total_seconds()
             end_time = last_true_time
             print(f"[GTCS] CLOSING — trigger={to_pht(trigger_time).strftime('%H:%M:%S')} → last_motion={to_pht(last_true_time).strftime('%H:%M:%S')} = {gtcs_duration:.1f}s")
         elif last_true_time and last_true_time > active_gtcs["start_time"]:
-            # Fallback: session start → last True reading
             gtcs_duration = (last_true_time - active_gtcs["start_time"]).total_seconds()
             end_time = last_true_time
             print(f"[GTCS] CLOSING (fallback) — duration={gtcs_duration:.1f}s")
         else:
-            # Last resort: use session open time, duration 0
             gtcs_duration = 0
             end_time = now_utc
-            print(f"[GTCS] CLOSING (no True readings found) — duration=0")
+            print(f"[GTCS] CLOSING (no True readings found)")
 
         gtcs_duration = max(0, gtcs_duration)
 
