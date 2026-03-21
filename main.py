@@ -192,10 +192,9 @@ POST_UPLOAD_SUPPRESS_SECONDS = 30
 
 # =====================================================================
 # [FIX 14] TIME WINDOW — how long a seizure_flag=True reading "counts"
-# Even if a device hasn't uploaded in 5s, it still counts as seizing.
-# This handles staggered uploads and brief gaps between True readings.
+# Set to 7s (upload interval is ~5s, so 7s gives reliable overlap).
 # =====================================================================
-SEIZURE_WINDOW_SECONDS = 5
+SEIZURE_WINDOW_SECONDS = 7
 
 # =====================================================================
 # IN-MEMORY STATE DICTS
@@ -524,7 +523,7 @@ async def delete_jerk_events_near_time(user_id: int, near_time: datetime, tolera
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v22")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v23")
 
 app.add_middleware(
     CORSMiddleware,
@@ -589,7 +588,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v22"}
+    return {"message": "Backend running - MPU6050 Sensor v23"}
 
 
 # =====================================================================
@@ -1082,7 +1081,14 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             # Close any open device sessions so oldest_start is calculated fresh
             await close_all_device_sessions_for_user(device_ids, now_utc)
 
-        _gtcs_motion_lost_time.pop(user_id, None)
+        # [FIX 19] Only clear the grace timer if there is NO active GTCS session.
+        # If a GTCS is already running and we briefly see devices=1 while another
+        # device's upload is staggered, we should NOT reset the grace timer.
+        # The grace timer is only meaningful when devices_with_seizure drops to 0,
+        # and it should not be cleared just because a straggler upload comes in True.
+        active_gtcs_check = await get_active_user_seizure(user_id, "GTCS")
+        if not active_gtcs_check:
+            _gtcs_motion_lost_time.pop(user_id, None)
 
         gtcs_threshold = (GTCS_THRESHOLD_MULTI_DEVICE_SECONDS
                           if devices_with_seizure >= 2
