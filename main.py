@@ -1,20 +1,16 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v9
+# SEIZURE MONITOR BACKEND - v10
 #
-# FIXES in v9:
-# [FIX 1] upload_seizure_event now handles time_valid=false:
-#         When ESP32 sends boot-relative timestamps (no NTP at event time),
-#         the backend uses SERVER TIME instead of the garbage timestamps.
-#         This fixes "Duration: 00:00:00" and wrong dates on the dashboard.
+# CHANGES in v10:
+# [CHANGE 1] Separated Jerk→GTCS escalation threshold from Path B GTCS threshold.
+#            New constant: JERK_TO_GTCS_ESCALATION_SECONDS = 10
+#            (was sharing GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15)
+#            Path A (Jerk): escalates to GTCS after 10s of all-3-device motion.
+#            Path B (GTCS): unchanged — 1 device>=20s, 2 devices>=15s.
+#            When a Jerk session escalates to GTCS, it is ONLY saved as GTCS,
+#            never as Jerk — the Jerk session is silently closed then replaced.
 #
-# [FIX 2] Added seizing_devices column to user_seizure_sessions.
-#         Stored as JSON string of device IDs that were seizing.
-#         This fixes dashboard showing only 1 device when multiple seizing.
-#
-# [FIX 3] Duplicate detection now also checks time_valid=false events
-#         using server-arrival time window instead of ESP32 timestamps.
-#
-# PREVIOUS (v8): Jerk → GTCS escalation on backend
+# PREVIOUS (v9): time_valid fix, seizing_devices column, duplicate detection
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -146,8 +142,24 @@ CONNECTED_THRESHOLD_SECONDS = 60
 STALE_SESSION_THRESHOLD_SECONDS = 120
 MIN_JERK_DURATION_SECONDS = 3
 MIN_GTCS_DURATION_SECONDS = 5
-GTCS_THRESHOLD_1_DEVICE_SECONDS = 20
-GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15
+
+# -----------------------------------------------------------------------
+# THRESHOLD CONSTANTS — kept separate on purpose:
+#
+#   JERK_TO_GTCS_ESCALATION_SECONDS   — how long a Jerk session (all 3
+#       devices moving) must persist before it escalates to GTCS.
+#       When escalation fires the Jerk record is discarded and only a
+#       GTCS record is written to history.
+#
+#   GTCS_THRESHOLD_1_DEVICE_SECONDS   — Path B: single device sustained
+#       motion threshold for a direct GTCS detection.
+#
+#   GTCS_THRESHOLD_MULTI_DEVICE_SECONDS — Path B: 2-device sustained
+#       motion threshold for a direct GTCS detection.
+# -----------------------------------------------------------------------
+JERK_TO_GTCS_ESCALATION_SECONDS    = 10   # Path A escalation: Jerk → GTCS
+GTCS_THRESHOLD_1_DEVICE_SECONDS    = 20   # Path B: 1 device direct GTCS
+GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15  # Path B: 2 devices direct GTCS
 
 
 # =====================================================================
@@ -324,7 +336,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v9")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v10")
 
 app.add_middleware(
     CORSMiddleware,
@@ -390,7 +402,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v9"}
+    return {"message": "Backend running - MPU6050 Sensor v10"}
 
 
 # =====================================================================
@@ -761,7 +773,12 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     # ==============================================================
     # PATH A — JERK (all 3 devices moving)
-    # After 15s still all-3 moving → escalate Jerk to GTCS
+    #
+    # Opens a "Jerk" session immediately when all 3 devices flag.
+    # After JERK_TO_GTCS_ESCALATION_SECONDS (10s) still moving →
+    # silently close the Jerk record and open a GTCS record instead.
+    # The Jerk session is NEVER written to history when escalated;
+    # only the GTCS record appears in the event log.
     # ==============================================================
     if devices_with_seizure >= 3:
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
@@ -772,6 +789,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             return {"status": "saved", "event": "GTCS"}
 
         if not active_jerk:
+            # All 3 devices just started moving — open a Jerk session (not yet saved to history)
             print(f"[JERK] *** STARTING JERK SESSION for user {user_id} (all 3 devices moving) ***")
             await database.execute(user_seizure_sessions.insert().values(
                 user_id=user_id, type="Jerk", start_time=ts_utc, end_time=None,
@@ -780,27 +798,31 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             return {"status": "saved", "event": "Jerk"}
         else:
             jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
-            if jerk_duration >= GTCS_THRESHOLD_MULTI_DEVICE_SECONDS:
-                print(f"[JERK→GTCS] *** ESCALATING Jerk to GTCS (duration={jerk_duration:.1f}s) ***")
+            if jerk_duration >= JERK_TO_GTCS_ESCALATION_SECONDS:
+                # Jerk has persisted long enough — escalate to GTCS.
+                # Close and DELETE the Jerk record so it never appears in history,
+                # then open a fresh GTCS record starting from when Jerk began.
+                print(f"[JERK→GTCS] *** ESCALATING Jerk to GTCS (duration={jerk_duration:.1f}s >= {JERK_TO_GTCS_ESCALATION_SECONDS}s) ***")
                 await database.execute(
-                    user_seizure_sessions.update()
+                    user_seizure_sessions.delete()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=now_utc)
                 )
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id,
                     type="GTCS",
-                    start_time=active_jerk["start_time"],
+                    start_time=active_jerk["start_time"],  # preserve original Jerk start time
                     end_time=None,
                     seizing_devices=json.dumps(device_ids)
                 ))
                 return {"status": "saved", "event": "GTCS"}
             else:
-                print(f"[JERK] Active Jerk continuing (id={active_jerk['id']}, dur={jerk_duration:.1f}s)")
+                print(f"[JERK] Active Jerk continuing (id={active_jerk['id']}, dur={jerk_duration:.1f}s / {JERK_TO_GTCS_ESCALATION_SECONDS}s)")
                 return {"status": "saved", "event": "Jerk"}
 
     # ==============================================================
     # PATH B — GTCS (independent, for 1–2 device scenarios)
+    # Thresholds: 1 device >= 20s, 2 devices >= 15s
+    # Completely separate from Path A — not affected by Jerk logic.
     # ==============================================================
     if devices_with_seizure >= 1:
         gtcs_threshold = GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2 else GTCS_THRESHOLD_1_DEVICE_SECONDS
@@ -892,28 +914,23 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     time_valid = payload.time_valid if payload.time_valid is not None else True
 
     if not time_valid:
-        # ESP32 v19+ holds events in RAM until NTP syncs before uploading.
-        # If somehow a time_valid=false event still arrives (e.g. old firmware,
-        # or device rebooted before flush), reject it — bad timestamps would
-        # corrupt the history log. The ESP32 will retry with real timestamps
-        # once NTP is available.
-        print(f"[SEIZURE EVENT v9] REJECTED — time_valid=False (boot-relative timestamps). "
+        print(f"[SEIZURE EVENT v10] REJECTED — time_valid=False (boot-relative timestamps). "
               f"ESP32 should hold events until NTP syncs.")
         return {"status": "rejected", "reason": "boot_relative_timestamps_not_accepted"}
 
     # Real NTP timestamps from ESP32
     start_utc = parse_unix_seconds(payload.start_time_ut)
     end_utc   = parse_unix_seconds(payload.end_time_ut)
-    print(f"[SEIZURE EVENT v9] time_valid=True — using ESP32 NTP timestamps")
+    print(f"[SEIZURE EVENT v10] time_valid=True — using ESP32 NTP timestamps")
 
-    print(f"[SEIZURE EVENT v9] user={user_id} type={payload.type} "
+    print(f"[SEIZURE EVENT v10] user={user_id} type={payload.type} "
           f"start={to_pht(start_utc).strftime('%Y-%m-%d %H:%M:%S PHT')} "
           f"end={to_pht(end_utc).strftime('%H:%M:%S PHT')} "
           f"dur={payload.duration_seconds}s "
           f"devices={payload.device_ids} seizing={payload.seizing_devices}")
 
     # Duplicate detection
-    tolerance = timedelta(seconds=30)  # wider window for server-time reconstructed events
+    tolerance = timedelta(seconds=30)
     existing_session = await database.fetch_one(
         user_seizure_sessions.select()
         .where(user_seizure_sessions.c.user_id == user_id)
@@ -922,10 +939,9 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         .where(user_seizure_sessions.c.start_time <= start_utc + tolerance)
     )
     if existing_session:
-        print(f"[SEIZURE EVENT v9] Duplicate detected (id={existing_session['id']}) — skipping")
+        print(f"[SEIZURE EVENT v10] Duplicate detected (id={existing_session['id']}) — skipping")
         return {"status": "duplicate", "event": payload.type}
 
-    # Store seizing_devices as JSON for dashboard display
     seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
 
     await database.execute(
@@ -939,13 +955,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         )
     )
 
-    # Build sensor rows to insert.
-    # If window_data is present (v20+ firmware), use the 10 actual varied readings
-    # per device — these produce a natural-looking graph instead of zigzag/flat lines.
-    # Fall back to snapshot-based repeated rows for older firmware.
-
     if payload.window_data:
-        # v20+ path: use actual varied window readings
         for dev_idx, wd in enumerate(payload.window_data):
             dev = await database.fetch_one(
                 devices.select().where(devices.c.device_id == wd.device_id)
@@ -958,8 +968,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
             if num_readings == 0:
                 continue
 
-            # Spread the window readings evenly across the full event duration
-            device_offset = timedelta(milliseconds=200 * dev_idx)  # small offset per device
+            device_offset = timedelta(milliseconds=200 * dev_idx)
             for idx, reading in enumerate(wd.readings):
                 offset_sec = (payload.duration_seconds * idx) / max(num_readings - 1, 1)
                 row_ts = start_utc + timedelta(seconds=offset_sec) + device_offset
@@ -977,7 +986,6 @@ async def upload_seizure_event(payload: SeizureEventPayload):
               f"seizing={payload.seizing_devices})")
 
     else:
-        # Legacy path (older firmware): repeat snapshot rows across duration
         SENSOR_ROW_INTERVAL_SEC = 2
         num_intervals = max(1, payload.duration_seconds // SENSOR_ROW_INTERVAL_SEC)
         num_intervals = min(num_intervals, 60)
@@ -1050,7 +1058,6 @@ async def admin_get_user_events(user_id: int, current_user=Depends(get_current_u
     for r in rows:
         seizing_device_ids = parse_seizing_devices(r)
 
-        # Fallback to querying sensor_data if seizing_devices not stored
         if not seizing_device_ids:
             start_utc = r["start_time"]
             end_utc = r["end_time"]
