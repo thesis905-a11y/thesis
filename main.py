@@ -1,47 +1,37 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v15
+# SEIZURE MONITOR BACKEND - v16
 #
-# FIXES in v15 (all 5 issues resolved):
+# FIX in v16:
 #
-# [FIX 1] 🔴 GTCS timer now uses a grace period on the backend side.
-#         In /api/device/upload, when the backend's own GTCS Path B
-#         timer is running but seizure count drops, we no longer
-#         immediately abandon the timer. Instead, a grace-period
-#         timestamp is stored in a module-level dict so that the timer
-#         only truly resets after GTCS_BACKEND_GRACE_SECONDS of
-#         continuous absence. Mirrors the base-station grace period.
+# [FIX 6] 🔴 DUPLICATE GTCS after SD upload — Race condition fixed.
 #
-# [FIX 2] 🔴 Backend GTCS Path B now responds to seizure_flag=True
-#         from individual devices immediately (early flag from base
-#         station FIX 3). The threshold timer is evaluated against
-#         the device_seizure_session start_time (which is now set
-#         as soon as the flag arrives), not just a counter snapshot.
-#         This reduces detection latency end-to-end.
+#         Root cause: When a confirmed SD-card seizure event arrives via
+#         upload_seizure_event(), the backend correctly deletes any OPEN
+#         real-time sessions (those with end_time=None). However, the
+#         PATH B real-time detector in /api/device/upload can STILL fire
+#         2-3 seconds AFTER the confirmed event was saved — because the
+#         device_seizure_sessions (which PATH B uses to measure motion
+#         duration) are still open at the time of the SD upload, and
+#         PATH B hasn't triggered yet. So PATH B fires moments later and
+#         creates a second GTCS row, giving duplicate entries in the app.
 #
-# [FIX 3] 🟡 seizureFlagForUpload is now set early by the base station
-#         (base station FIX 3). Backend /api/device/upload now also
-#         opens a device_seizure_session row as soon as seizure_flag
-#         is true — previously it only opened the row when the flag
-#         arrived, but the session-duration check was computing time
-#         from the *current* upload call rather than from the session
-#         start. Now uses session start_time properly for Path B.
+#         Fix: Added a module-level dict _post_upload_suppress_until that
+#         stores a datetime per user. After a confirmed SD-card event is
+#         received, PATH B real-time detection is suppressed for
+#         POST_UPLOAD_SUPPRESS_SECONDS (30s) for that user. This window
+#         is long enough to cover the ~2-5s lag between SD upload and
+#         the last PATH B poll, but short enough that a real new seizure
+#         within 30s would still be caught (it would come via SD card
+#         again anyway since the base station saves everything to SD).
 #
-# [FIX 4] 🟡 upload_seizure_event: now also deletes any open Jerk OR
-#         GTCS real-time session before inserting the confirmed event,
-#         preventing duplicate real-time ghost events appearing in the
-#         app alongside the confirmed SD-card event.
-#         (Was already present for Jerk in v14; now also explicit for
-#         GTCS when a confirmed GTCS arrives.)
+#         Additionally, upon receiving a confirmed SD event, ALL open
+#         device_seizure_sessions for ALL of that user's devices are
+#         now explicitly closed, so the oldest_device_session duration
+#         check in PATH B immediately evaluates to 0s on the next poll
+#         even if suppression somehow didn't apply.
 #
-# [FIX 5] 🟢 Backend/base-station logic alignment:
-#         - GTCS_BACKEND_GRACE_SECONDS = 3 (matches base station 3s)
-#         - GTCS Path B session start is anchored to the device session
-#           start_time (oldest active device session), not to the moment
-#           the threshold is crossed. This matches base-station behavior
-#           where seizureSessionStartUT is set to gtcsMotionStartTime.
-#
-# PREVIOUS (v14): compute_duration() prefers stored duration_seconds,
-#                 end_time reconstructed when start==end.
+# PREVIOUS (v15): Grace period, sliding window, early flag, immediate
+#                 upload, participatedInSession from timer-start.
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -179,16 +169,22 @@ GTCS_THRESHOLD_1_DEVICE_SECONDS       = 20
 GTCS_THRESHOLD_MULTI_DEVICE_SECONDS   = 15
 RECENT_GTCS_SUPPRESS_JERK_SECONDS     = 60
 
-# FIX 1 & FIX 5: Grace period — matches base station GTCS_MOTION_GRACE_MS=3s
-# When device seizure count drops below threshold, we wait this many seconds
-# before considering the GTCS Path B timer truly interrupted.
+# v15: Grace period — matches base station GTCS_MOTION_GRACE_MS=3s
 GTCS_BACKEND_GRACE_SECONDS = 3
 
-# FIX 1: Module-level dict to track when each user's GTCS Path B motion was
-# last seen absent. Key = user_id, Value = datetime (UTC) when motion dropped.
-# This dict lives in memory (reset on server restart, which is acceptable —
-# on restart, stale sessions are cleaned up anyway).
+# FIX 6: After a confirmed SD-card event is received, suppress PATH B
+# real-time GTCS detection for this many seconds per user.
+# 30s is enough to cover the ~2-5s lag between SD upload and last
+# PATH B poll, while still being short enough to not miss a new real
+# seizure (which would arrive via SD card anyway).
+POST_UPLOAD_SUPPRESS_SECONDS = 30
+
+# v15: Grace period tracker — key=user_id, value=datetime when motion dropped
 _gtcs_motion_lost_time: dict = {}
+
+# FIX 6: Post-SD-upload suppression — key=user_id, value=datetime until which
+# PATH B real-time GTCS detection is suppressed for that user
+_post_upload_suppress_until: dict = {}
 
 
 # =====================================================================
@@ -383,11 +379,28 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
                 .values(end_time=now_utc)
             )
 
+# FIX 6: Helper — close ALL open device_seizure_sessions for a user's devices
+# Called after a confirmed SD event so PATH B duration timer resets to 0
+async def close_all_device_sessions_for_user(device_ids: list, now_utc: datetime):
+    for device_id in device_ids:
+        open_sessions = await database.fetch_all(
+            device_seizure_sessions.select()
+            .where(device_seizure_sessions.c.device_id == device_id)
+            .where(device_seizure_sessions.c.end_time == None)
+        )
+        for s in open_sessions:
+            print(f"[POST-UPLOAD] Closing device session id={s['id']} device={device_id} — confirmed SD event received")
+            await database.execute(
+                device_seizure_sessions.update()
+                .where(device_seizure_sessions.c.id == s["id"])
+                .values(end_time=now_utc)
+            )
+
 
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v15")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v16")
 
 app.add_middleware(
     CORSMiddleware,
@@ -452,7 +465,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v15"}
+    return {"message": "Backend running - MPU6050 Sensor v16"}
 
 
 # =====================================================================
@@ -627,10 +640,6 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 # SEIZURE EVENTS — READ ENDPOINTS
 # =====================================================================
 def compute_duration(row) -> Optional[int]:
-    """
-    v14 fix retained: Always prefer stored duration_seconds when set and > 0.
-    Only fall back to (end_time - start_time) if not stored.
-    """
     stored = row["duration_seconds"] if "duration_seconds" in row.keys() else None
     if stored is not None and stored > 0:
         return stored
@@ -804,7 +813,6 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     await close_stale_sessions(user_id, device_ids, now_utc)
 
-    # Open/close device-level seizure session based on flag
     active_device = await get_active_device_seizure(payload.device_id)
     if payload.seizure_flag:
         if not active_device:
@@ -831,12 +839,11 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
 
     # ================================================================
-    # PATH A — JERK (3-device group, unchanged from v14)
+    # PATH A — JERK (3-device group, unchanged from v15)
     # ================================================================
     if devices_with_seizure >= 3:
         if active_gtcs:
             print(f"[GTCS] Continuing (escalated, id={active_gtcs['id']})")
-            # Clear grace timer since motion is active
             _gtcs_motion_lost_time.pop(user_id, None)
             return {"status": "saved", "event": "GTCS"}
 
@@ -875,9 +882,6 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 print(f"[JERK] Continuing (id={active_jerk['id']}, dur={jerk_duration:.1f}s)")
                 return {"status": "saved", "event": "Jerk"}
 
-    # ================================================================
-    # PATH A — Close Jerk if group dropped
-    # ================================================================
     else:
         if active_jerk:
             jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
@@ -892,19 +896,19 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     # ================================================================
     # PATH B — GTCS (1-2 device sustained motion)
     #
-    # FIX 1 & FIX 2: Grace period + early flag support.
-    #
-    # When devices_with_seizure >= 1:
-    #   - Clear the grace-period timer (motion is present).
-    #   - Compute motion duration from oldest active device session
-    #     start_time (FIX 5: anchored to session start, not threshold).
-    #   - If duration >= threshold, open GTCS session.
-    #
-    # When devices_with_seizure == 0:
-    #   - If a GTCS session is open, apply grace period before closing.
-    #   - Only close GTCS after GTCS_BACKEND_GRACE_SECONDS of absence.
+    # FIX 6: Check suppression window FIRST before doing anything.
+    # If a confirmed SD-card event was recently received, skip PATH B
+    # entirely to prevent duplicate real-time GTCS creation.
     # ================================================================
     if devices_with_seizure >= 1:
+
+        # FIX 6: If within post-upload suppression window, skip PATH B
+        suppress_until = _post_upload_suppress_until.get(user_id)
+        if suppress_until and now_utc < suppress_until:
+            remaining = (suppress_until - now_utc).total_seconds()
+            print(f"[GTCS PATH B] *** SUPPRESSED (post-SD-upload, {remaining:.1f}s remaining) ***")
+            return {"status": "saved", "event": "suppressed_post_upload"}
+
         # Motion present — clear grace period timer
         _gtcs_motion_lost_time.pop(user_id, None)
 
@@ -917,8 +921,6 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             print(f"[GTCS PATH B] Continuing (id={active_gtcs['id']}, devices={devices_with_seizure})")
             return {"status": "saved", "event": "GTCS"}
 
-        # FIX 5: Anchor timer to oldest active device session start_time
-        # (matches base station behavior where seizureSessionStartUT = gtcsMotionStartTime)
         oldest_device_session = None
         seizing_device_ids = []
         for did in device_ids:
@@ -934,8 +936,6 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
             if motion_duration >= gtcs_threshold:
                 print(f"[GTCS PATH B] *** TRIGGERED ***")
-                # FIX 5: Start time anchored to when device session opened,
-                # not to now (mirrors base station seizureSessionStartUT)
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id, type="GTCS",
                     start_time=oldest_device_session["start_time"], end_time=None,
@@ -948,13 +948,12 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     # ================================================================
     # No devices with seizure flag
-    # FIX 1: Grace period before closing open GTCS session
+    # v15: Grace period before closing open GTCS session
     # ================================================================
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
     if active_gtcs:
         gtcs_duration = (now_utc - active_gtcs["start_time"]).total_seconds()
 
-        # FIX 1: Apply grace period — don't close immediately on first absence
         if user_id not in _gtcs_motion_lost_time:
             _gtcs_motion_lost_time[user_id] = now_utc
             print(f"[GTCS] Motion absent — grace period started ({GTCS_BACKEND_GRACE_SECONDS}s) for user={user_id}")
@@ -966,7 +965,6 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             print(f"[GTCS] Grace period active ({time_absent:.1f}s / {GTCS_BACKEND_GRACE_SECONDS}s) — keeping GTCS open")
             return {"status": "saved", "event": "GTCS_grace"}
 
-        # Grace period expired — now close the session
         _gtcs_motion_lost_time.pop(user_id, None)
 
         if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
@@ -979,7 +977,6 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         else:
             print(f"[GTCS] Keeping open (dur={gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s)")
     else:
-        # No active GTCS and no motion — clear any stale grace timer
         _gtcs_motion_lost_time.pop(user_id, None)
 
     return {"status": "saved", "event": "none"}
@@ -1002,25 +999,23 @@ async def upload_seizure_event(payload: SeizureEventPayload):
 
     time_valid = payload.time_valid if payload.time_valid is not None else True
     if not time_valid:
-        print(f"[SEIZURE EVENT v15] REJECTED — time_valid=False")
+        print(f"[SEIZURE EVENT v16] REJECTED — time_valid=False")
         return {"status": "rejected", "reason": "boot_relative_timestamps_not_accepted"}
 
     start_utc = parse_unix_seconds(payload.start_time_ut)
     end_utc   = parse_unix_seconds(payload.end_time_ut)
 
-    # Guard against 0-second duration
     duration_sec = payload.duration_seconds
     if duration_sec <= 0:
         computed = int((end_utc - start_utc).total_seconds())
         duration_sec = max(1, computed)
-        print(f"[SEIZURE EVENT v15] duration corrected: {payload.duration_seconds} → {duration_sec}s")
+        print(f"[SEIZURE EVENT v16] duration corrected: {payload.duration_seconds} → {duration_sec}s")
 
-    # v14 fix: reconstruct end_utc if start == end
     if end_utc <= start_utc and duration_sec > 0:
         end_utc = start_utc + timedelta(seconds=duration_sec)
-        print(f"[SEIZURE EVENT v15] end_time reconstructed: start+{duration_sec}s = {to_pht(end_utc).strftime('%H:%M:%S PHT')}")
+        print(f"[SEIZURE EVENT v16] end_time reconstructed: start+{duration_sec}s = {to_pht(end_utc).strftime('%H:%M:%S PHT')}")
 
-    print(f"[SEIZURE EVENT v15] user={user_id} type={payload.type} "
+    print(f"[SEIZURE EVENT v16] user={user_id} type={payload.type} "
           f"start={to_pht(start_utc).strftime('%Y-%m-%d %H:%M:%S PHT')} "
           f"end={to_pht(end_utc).strftime('%H:%M:%S PHT')} "
           f"dur={duration_sec}s")
@@ -1034,16 +1029,15 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         .where(user_seizure_sessions.c.start_time <= start_utc + tolerance)
     )
     if existing_session:
-        print(f"[SEIZURE EVENT v15] Duplicate (id={existing_session['id']}) — skipping")
+        print(f"[SEIZURE EVENT v16] Duplicate (id={existing_session['id']}) — skipping")
         return {"status": "duplicate", "event": payload.type}
 
     now_utc = datetime.now(timezone.utc)
 
-    # FIX 4: Delete ALL open real-time sessions (Jerk AND GTCS) before
-    # inserting the confirmed SD-card event to prevent ghost duplicates.
+    # Delete all open real-time sessions (Jerk AND GTCS) — confirmed SD takes precedence
     open_jerk = await get_active_user_seizure(user_id, "Jerk")
     if open_jerk:
-        print(f"[SEIZURE EVENT v15] Deleting open real-time Jerk (id={open_jerk['id']}) — confirmed event takes precedence")
+        print(f"[SEIZURE EVENT v16] Deleting open real-time Jerk (id={open_jerk['id']})")
         await database.execute(
             user_seizure_sessions.delete()
             .where(user_seizure_sessions.c.id == open_jerk["id"])
@@ -1051,15 +1045,26 @@ async def upload_seizure_event(payload: SeizureEventPayload):
 
     open_gtcs = await get_active_user_seizure(user_id, "GTCS")
     if open_gtcs:
-        print(f"[SEIZURE EVENT v15] Deleting open real-time GTCS (id={open_gtcs['id']}) — confirmed event takes precedence")
+        print(f"[SEIZURE EVENT v16] Deleting open real-time GTCS (id={open_gtcs['id']})")
         await database.execute(
             user_seizure_sessions.delete()
             .where(user_seizure_sessions.c.id == open_gtcs["id"])
         )
 
-    # FIX 4: Also clear the grace-period timer so it doesn't interfere
-    # with the next real seizure event detection after this confirmed upload.
+    # Clear grace timer
     _gtcs_motion_lost_time.pop(user_id, None)
+
+    # FIX 6: Set suppression window — PATH B real-time GTCS detection is
+    # suppressed for POST_UPLOAD_SUPPRESS_SECONDS after this confirmed event.
+    _post_upload_suppress_until[user_id] = now_utc + timedelta(seconds=POST_UPLOAD_SUPPRESS_SECONDS)
+    print(f"[SEIZURE EVENT v16] PATH B suppressed for {POST_UPLOAD_SUPPRESS_SECONDS}s for user={user_id}")
+
+    # FIX 6: Close ALL open device_seizure_sessions for this user's devices
+    # so PATH B duration timer immediately evaluates to 0s on next poll
+    all_user_device_ids = [d["device_id"] for d in await database.fetch_all(
+        devices.select().where(devices.c.user_id == user_id)
+    )]
+    await close_all_device_sessions_for_user(all_user_device_ids, now_utc)
 
     seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
 
@@ -1090,7 +1095,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
                     gyro_x=reading.gx, gyro_y=reading.gy, gyro_z=reading.gz,
                     battery_percent=reading.bp, seizure_flag=wd.seizure_flag,
                 ))
-        print(f"[SEIZURE EVENT v15] Saved {payload.type} ({duration_sec}s, window_data)")
+        print(f"[SEIZURE EVENT v16] Saved {payload.type} ({duration_sec}s, window_data)")
     else:
         SENSOR_ROW_INTERVAL_SEC = 2
         num_intervals = min(max(1, duration_sec // SENSOR_ROW_INTERVAL_SEC), 60)
@@ -1108,7 +1113,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
                     gyro_x=sd_item.gyro_x, gyro_y=sd_item.gyro_y, gyro_z=sd_item.gyro_z,
                     battery_percent=sd_item.battery_percent, seizure_flag=sd_item.seizure_flag,
                 ))
-        print(f"[SEIZURE EVENT v15] Saved {payload.type} ({duration_sec}s, legacy snapshot)")
+        print(f"[SEIZURE EVENT v16] Saved {payload.type} ({duration_sec}s, legacy snapshot)")
 
     return {
         "status": "saved",
