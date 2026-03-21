@@ -322,6 +322,14 @@ async def get_active_user_seizure(user_id: int, seizure_type: str):
         .order_by(user_seizure_sessions.c.start_time.desc())
     )
 
+async def get_active_device_seizure(device_id: str):
+    return await database.fetch_one(
+        device_seizure_sessions.select()
+        .where(device_seizure_sessions.c.device_id == device_id)
+        .where(device_seizure_sessions.c.end_time == None)
+        .order_by(device_seizure_sessions.c.start_time.desc())
+    )
+
 async def get_any_active_user_seizure(user_id: int):
     """Returns any open seizure session (Jerk or GTCS)."""
     return await database.fetch_one(
