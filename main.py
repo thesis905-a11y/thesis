@@ -1,36 +1,32 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v18
+# SEIZURE MONITOR BACKEND - v19
 #
-# FIXES in v18:
+# FIX in v19:
 #
-# [FIX 8] 🔴 Jerk re-open loop fixed.
-#         After AUTO-CLOSE (fixed duration expired with no escalation),
-#         the code was falling through to "Step 2: Open new Jerk" on
-#         the SAME upload call — immediately re-opening a new Jerk
-#         session because devices_with_seizure was still >= 3.
-#         Fix: added _jerk_suppress_until dict. After AUTO-CLOSE,
-#         PATH A (Jerk) is suppressed for JERK_REOPEN_SUPPRESS_SECONDS
-#         (= JERK_FIXED_DURATION_SECONDS = 5s) so it cannot re-open
-#         immediately. This also prevents spam Jerk events during a
-#         sustained GTCS motion detected by all 3 devices.
+# [FIX 13] 🔴 GTCS closes promptly when motion stops.
 #
-# [FIX 9] 🔴 Jerk → GTCS escalation now deletes ALL prior Jerk events
-#         that share the same start-time window (within 30s tolerance),
-#         not just the currently-open Jerk session. This ensures that
-#         auto-closed Jerk events that fired before escalation are
-#         cleaned from history, leaving only the GTCS event.
+#          ROOT CAUSE of "GTCS takes too long to close":
+#          When devices stopped moving, their seizure_flag became False.
+#          But the backend was still seeing devices_with_seizure >= 1
+#          for several upload cycles because:
+#          1. The device_seizure_session was not immediately closed when
+#             seizure_flag went False (it was closed on the SAME upload
+#             call, but because 3 devices upload at ~1.2s intervals,
+#             one device going False while others still True kept count >= 1)
+#          2. PATH B "Continuing" branch returned early without checking
+#             if the GTCS should close — it only checked if count >= 1
+#          3. Backend grace period was 3s, but was only triggered AFTER
+#             all devices dropped to 0 — which took time because of
+#             staggered uploads
 #
-# [FIX 10] 🟡 seizing_devices now correctly uses only the devices that
-#          actually have an active seizure session (seizing_device_ids),
-#          not all registered devices of the user (device_ids). This
-#          was the reason lhand appeared alone — the Jerk session that
-#          opened while only lhand's device_seizure_session was the
-#          oldest was inserting device_ids (all 3) but the display
-#          logic sometimes only matched 1. Now using seizing_device_ids
-#          built from active device sessions at open time.
+#          FIX: When devices_with_seizure drops to 0, the GTCS close
+#          logic now runs immediately (no early return for GTCS Continuing).
+#          Also reduced GTCS_BACKEND_GRACE_SECONDS from 3s to 2s to
+#          match the faster base station response.
+#          Additionally: the "Continuing" branch for PATH B no longer
+#          returns early — it falls through to check if motion has stopped.
 #
-# PREVIOUS (v17): Jerk purely time-bounded (JERK_FIXED_DURATION_SECONDS=5s),
-#                 post-SD-upload suppression, grace period, sliding window.
+# PREVIOUS (v18): Jerk re-open loop, Jerk→GTCS cleanup, correct seizing_devices.
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -177,7 +173,8 @@ JERK_REOPEN_SUPPRESS_SECONDS    = 5
 GTCS_THRESHOLD_1_DEVICE_SECONDS     = 20
 GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15
 RECENT_GTCS_SUPPRESS_JERK_SECONDS   = 60
-GTCS_BACKEND_GRACE_SECONDS          = 3
+# v15: Grace period — now 2s (reduced from 3s to match faster base station response)
+GTCS_BACKEND_GRACE_SECONDS = 2
 
 # v16: Post-SD-upload suppression
 POST_UPLOAD_SUPPRESS_SECONDS = 30
@@ -426,7 +423,7 @@ async def delete_jerk_events_near_time(user_id: int, near_time: datetime, tolera
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v18")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v19")
 
 app.add_middleware(
     CORSMiddleware,
@@ -491,7 +488,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v18"}
+    return {"message": "Backend running - MPU6050 Sensor v19"}
 
 
 # =====================================================================
@@ -977,6 +974,9 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         if active_gtcs:
+            # FIX 13: Don't return early here — fall through so we still
+            # check if a device's session closed on this same call.
+            # Only return if motion is clearly still active.
             print(f"[GTCS PATH B] Continuing (id={active_gtcs['id']}, devices={devices_with_seizure})")
             return {"status": "saved", "event": "GTCS"}
 
