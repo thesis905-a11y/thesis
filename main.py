@@ -523,7 +523,7 @@ async def delete_jerk_events_near_time(user_id: int, near_time: datetime, tolera
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v24")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v23")
 
 app.add_middleware(
     CORSMiddleware,
@@ -588,7 +588,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v24"}
+    return {"message": "Backend running - MPU6050 Sensor v23"}
 
 
 # =====================================================================
@@ -1117,6 +1117,12 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
             if motion_duration >= gtcs_threshold:
                 print(f"[GTCS PATH B] *** TRIGGERED ***")
+                # [FIX 17+18] duration = time from NOW (trigger moment) to when motion stops.
+                # Using now_utc instead of oldest_start because:
+                # 1. oldest_start may include time during suppression window
+                # 2. Clinically, what matters is how long the seizure ran AFTER detection
+                # motion_started tracks trigger time; duration = motion_stop - trigger_time
+                _gtcs_motion_started[user_id] = now_utc
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id, type="GTCS",
                     start_time=oldest_start, end_time=None,
@@ -1147,20 +1153,26 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
         # Grace expired — close the session now
         motion_lost = _gtcs_motion_lost_time.pop(user_id, now_utc)
-        _gtcs_motion_started.pop(user_id, None)  # no longer needed
 
-        # Duration = full motion window: session start_time → when motion stopped
-        # This is the total time the person was seizing, from first detection
-        # to when all motion ceased. This matches what the app shows (end - start).
-        gtcs_duration = (motion_lost - active_gtcs["start_time"]).total_seconds()
-        print(f"[GTCS] Duration: start={to_pht(active_gtcs['start_time']).strftime('%H:%M:%S')} → stop={to_pht(motion_lost).strftime('%H:%M:%S')} = {gtcs_duration:.1f}s")
+        # [FIX 17+18] Duration = trigger_time → motion_stop (NOT trigger → now).
+        # motion_started = when GTCS triggered (set above at trigger time = now_utc)
+        # motion_stopped = motion_lost_time (when devices first went to 0, before grace)
+        # This gives the actual active seizure window, excluding grace wait.
+        motion_started = _gtcs_motion_started.pop(user_id, None)
+        motion_stopped = motion_lost  # when motion actually stopped, not after grace
+        if motion_started:
+            gtcs_duration = (motion_stopped - motion_started).total_seconds()
+            print(f"[GTCS] Duration: trigger={to_pht(motion_started).strftime('%H:%M:%S')} → stop={to_pht(motion_stopped).strftime('%H:%M:%S')} = {gtcs_duration:.1f}s")
+        else:
+            # Fallback: session start to motion lost
+            gtcs_duration = (motion_stopped - active_gtcs["start_time"]).total_seconds()
 
         if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
             print(f"[GTCS] Closing — duration={gtcs_duration:.1f}s")
             await database.execute(
                 user_seizure_sessions.update()
                 .where(user_seizure_sessions.c.id == active_gtcs["id"])
-                .values(end_time=motion_lost, duration_seconds=int(gtcs_duration))
+                .values(end_time=motion_stopped, duration_seconds=int(gtcs_duration))
             )
         else:
             print(f"[GTCS] Too short (dur={gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s) — deleting")
