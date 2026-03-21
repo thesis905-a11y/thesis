@@ -201,6 +201,9 @@ SEIZURE_WINDOW_SECONDS = 5
 # IN-MEMORY STATE DICTS
 # =====================================================================
 _gtcs_motion_lost_time: dict      = {}  # user_id → datetime when motion dropped
+_gtcs_motion_started: dict        = {}  # user_id → datetime when motion actually began
+                                        # duration = motion_stopped - motion_started
+                                        # NOT end_time - start_time
 _post_upload_suppress_until: dict = {}  # user_id → datetime until PATH B suppressed
 _jerk_suppress_until: dict        = {}  # user_id → datetime until Jerk cannot re-open
 
@@ -403,17 +406,20 @@ async def get_recent_seizure_data(device_ids: list, now_utc: datetime):
     }
 
 # =====================================================================
-# [FIX 16] get_continuous_seizure_start — find when this device's
-# current seizure bout actually started, tolerating brief gaps.
+# get_continuous_seizure_start — find when this device's current
+# seizure bout actually started, with STRICT gap tolerance.
 #
-# Algorithm: Walk backwards through sensor_data rows with
-# seizure_flag=True. As long as consecutive rows are within
-# SEIZURE_WINDOW_SECONDS of each other, they're part of the same bout.
-# Return the timestamp of the first row in this continuous block.
+# KEY FIX: We only chain rows that are <= SEIZURE_WINDOW_SECONDS apart.
+# If there's a gap > SEIZURE_WINDOW_SECONDS, we STOP — that's a new bout.
+# We do NOT look back more than GTCS_THRESHOLD_1_DEVICE_SECONDS + buffer
+# because anything older than the threshold can't have triggered GTCS anyway.
+# This prevents duration inflation from stale old readings.
 # =====================================================================
 async def get_continuous_seizure_start(device_id: str, now_utc: datetime) -> datetime:
-    # Get all True readings in a reasonable lookback window (2 minutes)
-    lookback = now_utc - timedelta(seconds=120)
+    # Only look back as far as the longest possible GTCS threshold + buffer
+    # This prevents old readings from inflating the duration
+    max_lookback_seconds = GTCS_THRESHOLD_1_DEVICE_SECONDS + 10  # 30s max
+    lookback = now_utc - timedelta(seconds=max_lookback_seconds)
     rows = await database.fetch_all(
         sensor_data.select()
         .where(sensor_data.c.device_id == device_id)
@@ -424,17 +430,16 @@ async def get_continuous_seizure_start(device_id: str, now_utc: datetime) -> dat
     if not rows:
         return now_utc
 
-    # Walk backwards — as long as gap between consecutive rows <= SEIZURE_WINDOW_SECONDS,
-    # they're the same continuous bout.
+    # Start from the most recent True reading and walk backwards.
+    # Stop as soon as the gap between consecutive readings exceeds
+    # SEIZURE_WINDOW_SECONDS — that's where the current bout actually started.
     earliest = rows[0]["timestamp"]
     for i in range(1, len(rows)):
         gap = (rows[i-1]["timestamp"] - rows[i]["timestamp"]).total_seconds()
         if gap <= SEIZURE_WINDOW_SECONDS:
-            # Part of same continuous bout — extend start backwards
             earliest = rows[i]["timestamp"]
         else:
-            # Gap too large — this is a separate older bout, stop here
-            break
+            break  # Gap too large — this is where the current bout started
 
     return earliest
 
@@ -519,7 +524,7 @@ async def delete_jerk_events_near_time(user_id: int, near_time: datetime, tolera
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v20")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v21")
 
 app.add_middleware(
     CORSMiddleware,
@@ -584,7 +589,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v20"}
+    return {"message": "Backend running - MPU6050 Sensor v21"}
 
 
 # =====================================================================
@@ -1093,6 +1098,10 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
             if motion_duration >= gtcs_threshold:
                 print(f"[GTCS PATH B] *** TRIGGERED ***")
+                # [FIX 17] Record when motion actually started so we can compute
+                # accurate duration later. duration = motion_stop - motion_start,
+                # NOT end_time - start_time (which includes the pre-trigger wait time).
+                _gtcs_motion_started[user_id] = oldest_start
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id, type="GTCS",
                     start_time=oldest_start, end_time=None,
@@ -1109,7 +1118,6 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     # ================================================================
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
     if active_gtcs:
-        gtcs_duration = (now_utc - active_gtcs["start_time"]).total_seconds()
 
         if user_id not in _gtcs_motion_lost_time:
             _gtcs_motion_lost_time[user_id] = now_utc
@@ -1122,19 +1130,32 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             print(f"[GTCS] Grace period active ({time_absent:.1f}s / {GTCS_BACKEND_GRACE_SECONDS}s) — keeping GTCS open")
             return {"status": "saved", "event": "GTCS_grace"}
 
+        # Grace expired — close the session now
         _gtcs_motion_lost_time.pop(user_id, None)
 
+        # [FIX 17] Compute duration as actual motion time:
+        # motion_started (when devices first moved) → motion_lost (when motion stopped)
+        # This excludes the pre-trigger waiting time and any post-stop wall time.
+        motion_started = _gtcs_motion_started.pop(user_id, None)
+        motion_stopped = now_utc  # motion stopped = now (grace just expired)
+        if motion_started:
+            gtcs_duration = (motion_stopped - motion_started).total_seconds()
+        else:
+            # Fallback: use session start if we don't have motion_started
+            gtcs_duration = (now_utc - active_gtcs["start_time"]).total_seconds()
+
         if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
-            print(f"[GTCS] Closing after grace period (dur={gtcs_duration:.1f}s)")
+            print(f"[GTCS] Closing after grace — actual motion duration={gtcs_duration:.1f}s")
             await database.execute(
                 user_seizure_sessions.update()
                 .where(user_seizure_sessions.c.id == active_gtcs["id"])
-                .values(end_time=now_utc)
+                .values(end_time=motion_stopped, duration_seconds=int(gtcs_duration))
             )
         else:
             print(f"[GTCS] Keeping open (dur={gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s)")
     else:
         _gtcs_motion_lost_time.pop(user_id, None)
+        _gtcs_motion_started.pop(user_id, None)
 
     return {"status": "saved", "event": "none"}
 
@@ -1211,6 +1232,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         await delete_jerk_events_near_time(user_id, start_utc, tolerance_seconds=60)
 
     _gtcs_motion_lost_time.pop(user_id, None)
+    _gtcs_motion_started.pop(user_id, None)
     _jerk_suppress_until.pop(user_id, None)
 
     _post_upload_suppress_until[user_id] = now_utc + timedelta(seconds=POST_UPLOAD_SUPPRESS_SECONDS)
