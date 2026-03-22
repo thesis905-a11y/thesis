@@ -741,7 +741,10 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     # ----------------------------------------------------------------
     # Realtime device seizure session tracking
-    # open/close exactly when seizure_flag changes
+    # open/close exactly when seizure_flag changes.
+    # IMPORTANT: use ts_utc (ESP32's own NTP timestamp) as end_time,
+    # NOT now_utc (server arrival). This eliminates network lag from
+    # the recorded duration.
     # ----------------------------------------------------------------
     active_device = await get_active_device_seizure(payload.device_id)
     if payload.seizure_flag:
@@ -753,11 +756,11 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             )
     else:
         if active_device:
-            # Close with EXACT current time — accurate duration
+            # Use ESP32 timestamp as end — eliminates HTTP upload lag
             await database.execute(
                 device_seizure_sessions.update()
                 .where(device_seizure_sessions.c.id == active_device["id"])
-                .values(end_time=now_utc)
+                .values(end_time=ts_utc)
             )
 
     # Count how many devices are currently in active seizure
@@ -792,13 +795,13 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             ))
             return {"status": "saved", "event": "Jerk"}
         else:
-            jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
+            jerk_duration = (ts_utc - active_jerk["start_time"]).total_seconds()
             if jerk_duration >= JERK_TO_GTCS_SECONDS:
                 print(f"[JERK→GTCS] *** ESCALATING Jerk to GTCS (duration={jerk_duration:.1f}s >= 10s) ***")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=now_utc,
+                    .values(end_time=ts_utc,
                             duration_seconds=int(jerk_duration))
                 )
                 await database.execute(user_seizure_sessions.insert().values(
@@ -837,15 +840,17 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                     oldest_device_session = ds
 
         if oldest_device_session:
-            motion_duration = (now_utc - oldest_device_session["start_time"]).total_seconds()
+            # Motion duration: from oldest device start → this upload's ESP32 timestamp
+            # (not now_utc, which includes server processing lag)
+            motion_duration = (ts_utc - oldest_device_session["start_time"]).total_seconds()
             print(f"[GTCS] Motion duration={motion_duration:.1f}s threshold={gtcs_threshold}s seizing={devices_with_seizure}")
             if motion_duration >= gtcs_threshold:
                 if active_jerk:
-                    jerk_dur = int((now_utc - active_jerk["start_time"]).total_seconds())
+                    jerk_dur = int((ts_utc - active_jerk["start_time"]).total_seconds())
                     await database.execute(
                         user_seizure_sessions.update()
                         .where(user_seizure_sessions.c.id == active_jerk["id"])
-                        .values(end_time=now_utc, duration_seconds=jerk_dur)
+                        .values(end_time=ts_utc, duration_seconds=jerk_dur)
                     )
                 print(f"[GTCS] *** DIRECT GTCS TRIGGERED (motion={motion_duration:.1f}s >= {gtcs_threshold}s, seizing={devices_with_seizure}) ***")
                 await database.execute(user_seizure_sessions.insert().values(
@@ -859,31 +864,34 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         return {"status": "saved", "event": "none"}
 
     # ----------------------------------------------------------------
-    # NO SEIZURE — close any open sessions with EXACT duration
+    # NO SEIZURE — close any open sessions using ESP32 timestamp
+    # as end_time so duration = actual motion time, not server lag.
     # ----------------------------------------------------------------
     if devices_with_seizure == 0:
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         if active_gtcs:
-            gtcs_duration = (now_utc - active_gtcs["start_time"]).total_seconds()
+            # Duration from GTCS start → this device's stop timestamp (ts_utc)
+            # This is accurate regardless of network delay
+            gtcs_duration = (ts_utc - active_gtcs["start_time"]).total_seconds()
             if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
-                print(f"[GTCS] Closing GTCS (duration={gtcs_duration:.1f}s)")
+                print(f"[GTCS] Closing GTCS (duration={gtcs_duration:.1f}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')})")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_gtcs["id"])
-                    .values(end_time=now_utc, duration_seconds=int(gtcs_duration))
+                    .values(end_time=ts_utc, duration_seconds=int(gtcs_duration))
                 )
             else:
                 print(f"[GTCS] Keeping GTCS open (duration={gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s)")
 
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
         if active_jerk:
-            jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
+            jerk_duration = (ts_utc - active_jerk["start_time"]).total_seconds()
             if jerk_duration >= MIN_JERK_DURATION_SECONDS:
-                print(f"[JERK] Closing Jerk (duration={jerk_duration:.1f}s)")
+                print(f"[JERK] Closing Jerk (duration={jerk_duration:.1f}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')})")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=now_utc, duration_seconds=int(jerk_duration))
+                    .values(end_time=ts_utc, duration_seconds=int(jerk_duration))
                 )
             else:
                 print(f"[JERK] Keeping Jerk open (duration={jerk_duration:.1f}s < min {MIN_JERK_DURATION_SECONDS}s)")
