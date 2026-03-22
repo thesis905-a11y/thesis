@@ -784,6 +784,18 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
 
         if active_gtcs:
+            # All 3 still seizing and GTCS active — close if THIS device just stopped
+            if not payload.seizure_flag:
+                gtcs_duration = (ts_utc - active_gtcs["start_time"]).total_seconds()
+                if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
+                    print(f"[GTCS] *** CLOSING GTCS (PATH A) — device {payload.device_id} stopped "
+                          f"(duration={gtcs_duration:.1f}s) ***")
+                    await database.execute(
+                        user_seizure_sessions.update()
+                        .where(user_seizure_sessions.c.id == active_gtcs["id"])
+                        .values(end_time=ts_utc, duration_seconds=int(gtcs_duration))
+                    )
+                    return {"status": "saved", "event": "GTCS_closed"}
             print(f"[GTCS] Active GTCS continuing (id={active_gtcs['id']})")
             return {"status": "saved", "event": "GTCS"}
 
@@ -828,6 +840,22 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
 
         if active_gtcs:
+            # GTCS is already active.
+            # If THIS device just stopped (seizure_flag=False), close GTCS NOW
+            # using ts_utc as end_time. Do NOT wait for all devices to reach 0.
+            if not payload.seizure_flag:
+                gtcs_duration = (ts_utc - active_gtcs["start_time"]).total_seconds()
+                if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
+                    print(f"[GTCS] *** CLOSING GTCS — device {payload.device_id} stopped "
+                          f"(duration={gtcs_duration:.1f}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')}) ***")
+                    await database.execute(
+                        user_seizure_sessions.update()
+                        .where(user_seizure_sessions.c.id == active_gtcs["id"])
+                        .values(end_time=ts_utc, duration_seconds=int(gtcs_duration))
+                    )
+                    return {"status": "saved", "event": "GTCS_closed"}
+                else:
+                    print(f"[GTCS] Device stopped but GTCS too short ({gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s) — keeping open")
             print(f"[GTCS] Active GTCS continuing (seizing={devices_with_seizure})")
             return {"status": "saved", "event": "GTCS"}
 
