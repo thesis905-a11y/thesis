@@ -819,14 +819,13 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         else:
             jerk_duration = (ts_utc - active_jerk["start_time"]).total_seconds()
             if jerk_duration >= JERK_TO_GTCS_SECONDS:
-                # Close Jerk session silently, open GTCS from jerk start time
-                # Only GTCS appears in history — no separate Jerk entry
+                # Rename Jerk → GTCS in-place, keep end_time=None so it stays OPEN.
+                # PATH B will continue tracking it and close when motion stops.
                 print(f"[JERK→GTCS] *** ESCALATING Jerk to GTCS (duration={jerk_duration:.1f}s >= 10s) ***")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=ts_utc, duration_seconds=int(jerk_duration),
-                            type="GTCS")  # rename Jerk → GTCS in-place
+                    .values(type="GTCS")  # rename only — end_time stays NULL
                 )
                 return {"status": "saved", "event": "GTCS"}
             else:
