@@ -980,17 +980,19 @@ async def upload_seizure_event(payload: SeizureEventPayload):
           f"dur={final_duration}s (payload={payload.duration_seconds}s ts_dur={timestamp_duration}s) "
           f"devices={payload.device_ids} seizing={payload.seizing_devices}")
 
-    # Duplicate detection (30s tolerance window)
+    # Duplicate detection (30s tolerance window, any type).
+    # If the backend already saved a Jerk or GTCS near this start time,
+    # the SD upload is a duplicate — skip it regardless of type.
     tolerance = timedelta(seconds=30)
     existing_session = await database.fetch_one(
         user_seizure_sessions.select()
         .where(user_seizure_sessions.c.user_id == user_id)
-        .where(user_seizure_sessions.c.type == payload.type)
         .where(user_seizure_sessions.c.start_time >= start_utc - tolerance)
         .where(user_seizure_sessions.c.start_time <= start_utc + tolerance)
     )
     if existing_session:
-        print(f"[SEIZURE EVENT v10] Duplicate detected (id={existing_session['id']}) — skipping")
+        print(f"[SEIZURE EVENT v10] Duplicate detected (id={existing_session['id']} "
+              f"type={existing_session['type']}) — skipping SD upload of {payload.type}")
         return {"status": "duplicate", "event": payload.type}
 
     seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
