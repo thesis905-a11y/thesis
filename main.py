@@ -1007,26 +1007,33 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     # FIX 2: Jerk→GTCS upgrade.
     #
     # If incoming event is GTCS and there's a closed Jerk in the DB whose
-    # end_time is within 30s BEFORE this GTCS start, it means the ESP32
-    # saved a Jerk online (when WiFi came back briefly) and then later
-    # saved the escalated GTCS from SD. Instead of inserting a duplicate-
-    # looking row, upgrade the Jerk to GTCS.
+    # end_time is within JERK_TO_GTCS_SECONDS (10s) BEFORE this GTCS start,
+    # it means the ESP32 escalated a Jerk to GTCS after 10s of sustained
+    # motion. The Jerk was already saved online and the GTCS is now arriving
+    # from SD. Upgrade the Jerk row to GTCS instead of inserting a new row.
+    #
+    # IMPORTANT: gap must be <= 10s (the ESP32 escalation threshold).
+    # A 26-second gap means the person stopped and started again — that is
+    # a NEW event, not an escalation. Do NOT upgrade in that case.
+    # The Jerk end_time must also be strictly BEFORE the GTCS start_time.
     # ------------------------------------------------------------------
     if payload.type == "GTCS":
-        jerk_upgrade_window = timedelta(seconds=30)
+        jerk_upgrade_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)  # 10s max gap
         overlapping_jerk = await database.fetch_one(
             user_seizure_sessions.select()
             .where(user_seizure_sessions.c.user_id == user_id)
             .where(user_seizure_sessions.c.type == "Jerk")
             .where(user_seizure_sessions.c.end_time != None)
-            # Jerk ended within 30s before this GTCS started — same episode
+            # Jerk ended at most 10s before this GTCS started (escalation window)
+            # AND Jerk must have ended before (or at) the GTCS start — not after
             .where(user_seizure_sessions.c.end_time >= start_utc - jerk_upgrade_window)
-            .where(user_seizure_sessions.c.end_time <= start_utc + jerk_upgrade_window)
+            .where(user_seizure_sessions.c.end_time <= start_utc)
         )
         if overlapping_jerk:
+            gap_sec = (start_utc - overlapping_jerk["end_time"]).total_seconds()
             print(f"[SEIZURE EVENT] Upgrading Jerk (id={overlapping_jerk['id']}) → GTCS "
                   f"(Jerk end={to_pht(overlapping_jerk['end_time']).strftime('%H:%M:%S')} "
-                  f"GTCS start={to_pht(start_utc).strftime('%H:%M:%S')})")
+                  f"GTCS start={to_pht(start_utc).strftime('%H:%M:%S')} gap={gap_sec:.1f}s)")
             seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
             await database.execute(
                 user_seizure_sessions.update()
