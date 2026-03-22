@@ -802,6 +802,16 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                         .where(user_seizure_sessions.c.id == active_gtcs["id"])
                         .values(end_time=ts_utc, duration_seconds=int(gtcs_duration))
                     )
+                    # Co-close all remaining device sessions
+                    for did in device_ids:
+                        remaining = await get_active_device_seizure(did)
+                        if remaining:
+                            print(f"[GTCS] Co-closing device session for {did} (GTCS ended)")
+                            await database.execute(
+                                device_seizure_sessions.update()
+                                .where(device_seizure_sessions.c.id == remaining["id"])
+                                .values(end_time=ts_utc)
+                            )
                     return {"status": "saved", "event": "GTCS_closed"}
             print(f"[GTCS] Active GTCS continuing (id={active_gtcs['id']})")
             return {"status": "saved", "event": "GTCS"}
@@ -872,6 +882,17 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                         .where(user_seizure_sessions.c.id == active_gtcs["id"])
                         .values(end_time=ts_utc, duration_seconds=int(gtcs_duration))
                     )
+                    # Close ALL remaining device seizure sessions so they don't
+                    # accumulate motion time and re-trigger a new GTCS immediately.
+                    for did in device_ids:
+                        remaining = await get_active_device_seizure(did)
+                        if remaining:
+                            print(f"[GTCS] Co-closing device session for {did} (GTCS ended)")
+                            await database.execute(
+                                device_seizure_sessions.update()
+                                .where(device_seizure_sessions.c.id == remaining["id"])
+                                .values(end_time=ts_utc)
+                            )
                     return {"status": "saved", "event": "GTCS_closed"}
                 else:
                     print(f"[GTCS] Device stopped but GTCS too short ({gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s) — keeping open")
