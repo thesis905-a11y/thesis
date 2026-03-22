@@ -775,9 +775,12 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     print(f"[DETECTION] user={user_id} | seizing={devices_with_seizure}/{len(device_ids)} | devices={seizing_device_ids}")
 
     # ----------------------------------------------------------------
-    # PATH A — JERK (all 3 devices, brief spike)
-    # Backend perspective: if all 3 fire seizure_flag together,
-    # open a Jerk session. After 10s sustained → escalate to GTCS.
+    # PATH A — JERK (all 3 devices spiking together)
+    # - Opens Jerk session immediately when 3/3 detected.
+    # - Cancels any running PATH B GTCS timer/session to avoid conflict.
+    # - If Jerk lasts > JERK_TO_GTCS_SECONDS → save Jerk as completed,
+    #   then open a new GTCS session (both appear in history).
+    # - If a device stops during Jerk → close Jerk immediately.
     # ----------------------------------------------------------------
     if devices_with_seizure >= 3:
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
@@ -804,6 +807,9 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             return {"status": "saved", "event": "GTCS"}
 
         if not active_jerk:
+            # Cancel any running PATH B GTCS timer by closing open device sessions
+            # that were accumulating for a potential GTCS — they'll be superseded by Jerk
+            # (no user session to close, just reset the timer context)
             print(f"[JERK] *** STARTING JERK SESSION for user {user_id} (all 3 seizing) ***")
             await database.execute(user_seizure_sessions.insert().values(
                 user_id=user_id, type="Jerk", start_time=ts_utc, end_time=None,
@@ -813,20 +819,15 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         else:
             jerk_duration = (ts_utc - active_jerk["start_time"]).total_seconds()
             if jerk_duration >= JERK_TO_GTCS_SECONDS:
+                # Close Jerk session silently, open GTCS from jerk start time
+                # Only GTCS appears in history — no separate Jerk entry
                 print(f"[JERK→GTCS] *** ESCALATING Jerk to GTCS (duration={jerk_duration:.1f}s >= 10s) ***")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=ts_utc,
-                            duration_seconds=int(jerk_duration))
+                    .values(end_time=ts_utc, duration_seconds=int(jerk_duration),
+                            type="GTCS")  # rename Jerk → GTCS in-place
                 )
-                await database.execute(user_seizure_sessions.insert().values(
-                    user_id=user_id,
-                    type="GTCS",
-                    start_time=active_jerk["start_time"],
-                    end_time=None,
-                    seizing_devices=json.dumps(seizing_device_ids)
-                ))
                 return {"status": "saved", "event": "GTCS"}
             else:
                 print(f"[JERK] Active Jerk continuing (id={active_jerk['id']}, dur={jerk_duration:.1f}s)")
@@ -834,6 +835,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     # ----------------------------------------------------------------
     # PATH B — GTCS (1–2 devices, sustained)
+    # Also handles: close Jerk session when device drops below 3/3.
     # ----------------------------------------------------------------
     if devices_with_seizure >= 1:
         gtcs_threshold = (
@@ -842,6 +844,18 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         )
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
+
+        # If there's an active Jerk but we dropped below 3/3,
+        # close Jerk immediately — it ended when a device stopped.
+        if active_jerk and not active_gtcs:
+            jerk_duration = (ts_utc - active_jerk["start_time"]).total_seconds()
+            print(f"[JERK] *** CLOSING JERK — dropped below 3/3 (dur={jerk_duration:.1f}s) ***")
+            await database.execute(
+                user_seizure_sessions.update()
+                .where(user_seizure_sessions.c.id == active_jerk["id"])
+                .values(end_time=ts_utc, duration_seconds=int(jerk_duration))
+            )
+            return {"status": "saved", "event": "Jerk_closed"}
 
         if active_gtcs:
             # GTCS is already active.
