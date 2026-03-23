@@ -1,27 +1,13 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v11 (JERK DURATION FIX)
+# SEIZURE MONITOR BACKEND - v12 (JERK DISCARD REMOVED)
 #
-# FIXES vs v10:
-# [FIX 1] Duplicate detection is now TYPE-SPECIFIC.
-#         A Jerk at T=0 no longer blocks a GTCS at T+7s.
-#         Same-type dedup window: 10s (was 30s cross-type).
-#         Cross-type events within the same minute are always allowed.
+# FIXES vs v11:
+# [FIX 5] Jerk discard logic completely removed from /api/device/upload.
+#         No Jerk session is ever deleted for being "too short".
+#         If all 3 devices stop seizing, the Jerk session is simply
+#         closed with its actual duration, however short.
 #
-# [FIX 2] Jerk→GTCS offline: when SD card sends a Jerk (short) then
-#         a GTCS a few seconds later, both are saved correctly because
-#         the duplicate check no longer cross-matches types.
-#
-# [FIX 3] upload_seizure_event: if a Jerk session already exists in DB
-#         that OVERLAPS the incoming GTCS time range (Jerk that escalated
-#         to GTCS on ESP32 side), update it to GTCS instead of inserting
-#         a duplicate. Handles the case where WiFi came back mid-escalation
-#         and the Jerk was already saved online before the GTCS arrived.
-#
-# [FIX 4] Jerk discard threshold lowered to 0.5s (was 5s = MIN_JERK_DURATION_SECONDS).
-#         Jerks are intentionally short events (1-3s). The old 5s minimum
-#         was incorrectly discarding all valid Jerk detections. Only true
-#         noise (<0.5s) is now discarded.
-#
+# PREVIOUS (v11): Jerk noise threshold 0.5s
 # PREVIOUS (v10): window_data, realtime duration, seizing_devices
 # =====================================================================
 
@@ -150,30 +136,13 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-CONNECTED_THRESHOLD_SECONDS = 60
-STALE_SESSION_THRESHOLD_SECONDS = 120
-
-MIN_JERK_DURATION_SECONDS           = 1
+CONNECTED_THRESHOLD_SECONDS         = 60
+STALE_SESSION_THRESHOLD_SECONDS     = 120
 MIN_GTCS_DURATION_SECONDS           = 5
 GTCS_THRESHOLD_1_DEVICE_SECONDS     = 15
 GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 10
 JERK_TO_GTCS_SECONDS                = 10
-
-# =====================================================================
-# FIX 1: TYPE-SPECIFIC DUPLICATE WINDOWS
-# Same-type (Jerk/Jerk or GTCS/GTCS): 10s window
-# Cross-type (Jerk vs GTCS): NO dedup — they are separate events
-# This allows a Jerk at T=0 and a GTCS at T+7s to both be saved.
-# =====================================================================
-SAME_TYPE_DEDUP_WINDOW_SECONDS = 10
-
-# =====================================================================
-# FIX 4: JERK NOISE THRESHOLD
-# Jerks are intentionally short (1-3s). Only discard if under 0.5s
-# which is true electrical/motion noise, not a real jerk event.
-# The old MIN_JERK_DURATION_SECONDS = 5 was discarding all valid Jerks.
-# =====================================================================
-JERK_NOISE_THRESHOLD_SECONDS = 0.5
+SAME_TYPE_DEDUP_WINDOW_SECONDS      = 10
 
 
 # =====================================================================
@@ -336,7 +305,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v11 jerk fix")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v12 no jerk discard")
 
 app.add_middleware(
     CORSMiddleware,
@@ -403,7 +372,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v11 jerk fix"}
+    return {"message": "Backend running - MPU6050 Sensor v12 no jerk discard"}
 
 
 # =====================================================================
@@ -778,6 +747,9 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     print(f"[DETECTION] user={user_id} | seizing={devices_with_seizure}/{len(device_ids)} | devices={seizing_device_ids}")
 
+    # ==================================================================
+    # ALL 3 DEVICES SEIZING — Jerk or Jerk→GTCS escalation
+    # ==================================================================
     if devices_with_seizure >= 3:
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
@@ -831,6 +803,9 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 print(f"[JERK] Active Jerk continuing (id={active_jerk['id']}, dur={jerk_duration:.1f}s)")
                 return {"status": "saved", "event": "Jerk"}
 
+    # ==================================================================
+    # 1-2 DEVICES SEIZING — GTCS path
+    # ==================================================================
     if devices_with_seizure >= 1:
         gtcs_threshold = (
             GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2
@@ -840,19 +815,8 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
 
         if active_jerk and not active_gtcs:
+            # Dropped below 3/3 — close the Jerk with whatever duration it has
             jerk_duration = (ts_utc - active_jerk["start_time"]).total_seconds()
-            # =========================================================
-            # FIX 4: Only discard if under 0.5s (true noise).
-            # Jerks are intentionally 1-3s — the old 5s threshold was
-            # discarding every valid Jerk event.
-            # =========================================================
-            if jerk_duration < JERK_NOISE_THRESHOLD_SECONDS:
-                print(f"[JERK] *** DISCARDING JERK — noise ({jerk_duration:.1f}s < {JERK_NOISE_THRESHOLD_SECONDS}s) ***")
-                await database.execute(
-                    user_seizure_sessions.delete()
-                    .where(user_seizure_sessions.c.id == active_jerk["id"])
-                )
-                return {"status": "saved", "event": "Jerk_discarded"}
             print(f"[JERK] *** CLOSING JERK — dropped below 3/3 (dur={jerk_duration:.1f}s) ***")
             await database.execute(
                 user_seizure_sessions.update()
@@ -912,10 +876,12 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 ))
                 return {"status": "saved", "event": "GTCS"}
             else:
-                print(f"[GTCS] Motion duration={motion_duration:.1f}s threshold={gtcs_threshold}s seizing={devices_with_seizure}")
-                print(f"[GTCS] Timer running — {motion_duration:.1f}s / {gtcs_threshold}s")
+                print(f"[GTCS] Timer running — {motion_duration:.1f}s / {gtcs_threshold}s (seizing={devices_with_seizure})")
         return {"status": "saved", "event": "none"}
 
+    # ==================================================================
+    # 0 DEVICES SEIZING — close any open sessions
+    # ==================================================================
     if devices_with_seizure == 0:
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         if active_gtcs:
@@ -932,41 +898,20 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
         if active_jerk:
+            # Close with actual duration — no discard, no minimum
             jerk_duration = (ts_utc - active_jerk["start_time"]).total_seconds()
-            # =========================================================
-            # FIX 4: Only discard if under 0.5s (true noise).
-            # =========================================================
-            if jerk_duration < JERK_NOISE_THRESHOLD_SECONDS:
-                print(f"[JERK] *** DISCARDING JERK — noise ({jerk_duration:.1f}s, false positive) ***")
-                await database.execute(
-                    user_seizure_sessions.delete()
-                    .where(user_seizure_sessions.c.id == active_jerk["id"])
-                )
-            else:
-                print(f"[JERK] Closing Jerk (duration={jerk_duration:.1f}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')})")
-                await database.execute(
-                    user_seizure_sessions.update()
-                    .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=ts_utc, duration_seconds=int(jerk_duration))
-                )
+            print(f"[JERK] Closing Jerk (duration={jerk_duration:.1f}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')})")
+            await database.execute(
+                user_seizure_sessions.update()
+                .where(user_seizure_sessions.c.id == active_jerk["id"])
+                .values(end_time=ts_utc, duration_seconds=int(jerk_duration))
+            )
 
     return {"status": "saved", "event": "none"}
 
 
 # =====================================================================
 # ESP32 UPLOAD — seizure event from SD card queue
-#
-# FIX 1: Duplicate detection is now TYPE-SPECIFIC.
-#   - Same-type dedup: 10s window (prevents true duplicates from
-#     double-flush of SD card).
-#   - Cross-type (Jerk vs GTCS): NO dedup — they are separate events.
-#     A Jerk at T=0 followed by a GTCS at T+7s are both saved.
-#
-# FIX 2: Jerk→GTCS escalation — if an incoming GTCS from SD overlaps
-#   a Jerk already in the DB (same start window, Jerk end_time is within
-#   the GTCS start), upgrade the Jerk row to GTCS instead of inserting
-#   a new row. This handles the edge case where WiFi reconnected mid-
-#   escalation and the Jerk was already saved online.
 # =====================================================================
 @app.post("/api/device/upload_seizure_event")
 async def upload_seizure_event(payload: SeizureEventPayload):
@@ -996,15 +941,13 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         else timestamp_duration
     )
 
-    print(f"[SEIZURE EVENT v11] user={user_id} type={payload.type} "
+    print(f"[SEIZURE EVENT v12] user={user_id} type={payload.type} "
           f"start={to_pht(start_utc).strftime('%Y-%m-%d %H:%M:%S PHT')} "
           f"end={to_pht(end_utc).strftime('%H:%M:%S PHT')} "
           f"dur={final_duration}s (payload={payload.duration_seconds}s ts_dur={timestamp_duration}s) "
           f"devices={payload.device_ids} seizing={payload.seizing_devices}")
 
-    # ------------------------------------------------------------------
-    # FIX 1: TYPE-SPECIFIC duplicate detection.
-    # ------------------------------------------------------------------
+    # Same-type duplicate detection
     same_type_tolerance = timedelta(seconds=SAME_TYPE_DEDUP_WINDOW_SECONDS)
     existing_same_type = await database.fetch_one(
         user_seizure_sessions.select()
@@ -1018,9 +961,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
               f"type={existing_same_type['type']}) — skipping SD upload of {payload.type}")
         return {"status": "duplicate", "event": payload.type}
 
-    # ------------------------------------------------------------------
-    # FIX 2: Jerk→GTCS upgrade.
-    # ------------------------------------------------------------------
+    # Jerk→GTCS upgrade
     if payload.type == "GTCS":
         jerk_upgrade_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
         overlapping_jerk = await database.fetch_one(
@@ -1057,7 +998,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
                 "seizing_devices": payload.seizing_devices,
             }
 
-    # No duplicate, no upgrade — insert as new event
+    # Insert as new event
     seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
 
     await database.execute(
@@ -1071,9 +1012,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         )
     )
 
-    # ----------------------------------------------------------------
     # Store sensor data for graph display
-    # ----------------------------------------------------------------
     if payload.window_data:
         for dev_idx, wd in enumerate(payload.window_data):
             dev = await database.fetch_one(
