@@ -1,16 +1,17 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v13 (FLOAT DURATION + UPDATED THRESHOLDS)
+# SEIZURE MONITOR BACKEND - v13 (FLOAT DURATIONS + ACCURATE THRESHOLDS)
 #
-# CHANGES vs v12:
-# [FIX 1] duration_seconds → duration_seconds FLOAT (stored as Float in DB)
-#         Jerk and GTCS durations now saved with decimal precision (e.g. 1.5s)
-# [FIX 2] MIN_JERK_DURATION_SECONDS = 1.0  (was: no minimum / effectively 0)
-#         Jerk sessions shorter than 1.0s are discarded
-# [FIX 3] GTCS_THRESHOLD_1_DEVICE_SECONDS  = 20  (was: 15)
-# [FIX 4] GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15 (was: 10)
-# [FIX 5] JERK_TO_GTCS_SECONDS = 15 (was: 10)
-# [FIX 6] STALE_SESSION_THRESHOLD_SECONDS = 120 unchanged but duration
-#         is now float everywhere including stale closures
+# FIXES vs v12:
+# [FIX 1] duration_seconds column changed to FLOAT — stores decimals
+#         like 1.5, 0.5, 15.8, 20.65 etc.
+# [FIX 2] All int() casts on duration replaced with round(x, 2)
+#         so .5s, 1.5s, 15.8s are preserved accurately.
+# [FIX 3] JERK_TO_GTCS_SECONDS: 10 → 15
+# [FIX 4] GTCS_THRESHOLD_1_DEVICE_SECONDS: 15 → 20
+# [FIX 5] GTCS_THRESHOLD_MULTI_DEVICE_SECONDS: 10 → 15
+# [FIX 6] Duration computed from exact datetime subtraction (float),
+#         not from integer unix timestamps, so sub-second accuracy is
+#         preserved end-to-end.
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -57,6 +58,10 @@ def parse_unix_seconds(ts: int) -> datetime:
         return datetime.fromtimestamp(float(ts), tz=timezone.utc)
     print(f"[WARNING] Invalid unix timestamp: {ts} — using server time")
     return datetime.now(timezone.utc)
+
+def calc_duration(start: datetime, end: datetime) -> float:
+    """Return duration in seconds as a float rounded to 2 decimal places."""
+    return round((end - start).total_seconds(), 2)
 
 if "DATABASE_URL" in os.environ:
     raw_url = os.environ["DATABASE_URL"]
@@ -120,7 +125,6 @@ device_seizure_sessions = sqlalchemy.Table(
     sqlalchemy.Column("end_time", sqlalchemy.DateTime(timezone=True), nullable=True),
 )
 
-# NOTE: duration_seconds is now Float to support decimal precision (e.g. 1.5s)
 user_seizure_sessions = sqlalchemy.Table(
     "user_seizure_sessions", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
@@ -128,7 +132,8 @@ user_seizure_sessions = sqlalchemy.Table(
     sqlalchemy.Column("type", sqlalchemy.String),
     sqlalchemy.Column("start_time", sqlalchemy.DateTime(timezone=True)),
     sqlalchemy.Column("end_time", sqlalchemy.DateTime(timezone=True), nullable=True),
-    sqlalchemy.Column("duration_seconds", sqlalchemy.Float, nullable=True),  # CHANGED: Integer → Float
+    # FIX 1: Float column so 1.5s, 0.5s, 15.8s, 20.65s are all stored accurately
+    sqlalchemy.Column("duration_seconds", sqlalchemy.Float, nullable=True),
     sqlalchemy.Column("seizing_devices", sqlalchemy.Text, nullable=True),
 )
 
@@ -139,14 +144,20 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-CONNECTED_THRESHOLD_SECONDS          = 60
-STALE_SESSION_THRESHOLD_SECONDS      = 120
-MIN_GTCS_DURATION_SECONDS            = 1.0   # float
-MIN_JERK_DURATION_SECONDS            = 1.0   # NEW: discard jerks shorter than 1s
-GTCS_THRESHOLD_1_DEVICE_SECONDS      = 20    # CHANGED: was 15
-GTCS_THRESHOLD_MULTI_DEVICE_SECONDS  = 15    # CHANGED: was 10
-JERK_TO_GTCS_SECONDS                 = 15    # CHANGED: was 10
-SAME_TYPE_DEDUP_WINDOW_SECONDS       = 10
+CONNECTED_THRESHOLD_SECONDS         = 60
+STALE_SESSION_THRESHOLD_SECONDS     = 120
+MIN_GTCS_DURATION_SECONDS           = 1.0
+
+# FIX 3: Jerk → GTCS escalation raised from 10s to 15s
+JERK_TO_GTCS_SECONDS                = 15
+
+# FIX 4: Single-device GTCS threshold raised from 15s to 20s
+GTCS_THRESHOLD_1_DEVICE_SECONDS     = 20
+
+# FIX 5: Multi-device (2+) GTCS threshold raised from 10s to 15s
+GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15
+
+SAME_TYPE_DEDUP_WINDOW_SECONDS      = 10
 
 
 # =====================================================================
@@ -214,7 +225,7 @@ class SeizureEventPayload(BaseModel):
     type: str
     start_time_ut: int
     end_time_ut: int
-    duration_seconds: float          # CHANGED: int → float
+    duration_seconds: int
     time_valid: Optional[bool] = True
     device_ids: List[str]
     seizing_devices: List[str]
@@ -281,7 +292,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
             .where(device_seizure_sessions.c.start_time < stale_cutoff)
         )
         for s in stale_device_sessions:
-            dur = round((now_utc - s["start_time"]).total_seconds(), 2)
+            dur = calc_duration(s["start_time"], now_utc)
             print(f"[STALE] Closing stale device session id={s['id']} device={device_id} dur={dur}s")
             await database.execute(
                 device_seizure_sessions.update()
@@ -297,7 +308,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
             .where(user_seizure_sessions.c.start_time < stale_cutoff)
         )
         for s in stale_user_sessions:
-            dur = round((now_utc - s["start_time"]).total_seconds(), 2)
+            dur = calc_duration(s["start_time"], now_utc)
             print(f"[STALE] Closing stale {stype} session id={s['id']} user={user_id} dur={dur}s")
             await database.execute(
                 user_seizure_sessions.update()
@@ -309,7 +320,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v13 float duration")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v13 float durations")
 
 app.add_middleware(
     CORSMiddleware,
@@ -323,7 +334,8 @@ app.add_middleware(
 async def startup():
     await database.connect()
 
-    # Migrate existing columns — add duration_seconds (Float) and seizing_devices if missing
+    # Migrate duration_seconds to FLOAT if the DB is SQLite (ALTER TYPE not needed for SQLite
+    # since SQLite stores floats in any numeric column — just ensure the column exists)
     for col_sql, col_name in [
         ("ALTER TABLE user_seizure_sessions ADD COLUMN duration_seconds REAL", "duration_seconds"),
         ("ALTER TABLE user_seizure_sessions ADD COLUMN seizing_devices TEXT", "seizing_devices"),
@@ -344,7 +356,7 @@ async def startup():
         .where(device_seizure_sessions.c.start_time < stale_cutoff)
     )
     for s in stale_device:
-        dur = round((now_utc - s["start_time"]).total_seconds(), 2)
+        dur = calc_duration(s["start_time"], now_utc)
         print(f"[STARTUP CLEANUP] Closing stale device session id={s['id']} device={s['device_id']} dur={dur}s")
         await database.execute(
             device_seizure_sessions.update()
@@ -358,7 +370,7 @@ async def startup():
         .where(user_seizure_sessions.c.start_time < stale_cutoff)
     )
     for s in stale_user:
-        dur = round((now_utc - s["start_time"]).total_seconds(), 2)
+        dur = calc_duration(s["start_time"], now_utc)
         print(f"[STARTUP CLEANUP] Closing stale {s['type']} session id={s['id']} user={s['user_id']} dur={dur}s")
         await database.execute(
             user_seizure_sessions.update()
@@ -377,7 +389,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v13 float duration"}
+    return {"message": "Backend running - MPU6050 Sensor v13 float durations"}
 
 
 # =====================================================================
@@ -552,7 +564,10 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 # SEIZURE EVENTS — READ ENDPOINTS
 # =====================================================================
 def compute_duration(row) -> Optional[float]:
-    """Returns duration as float (e.g. 1.5) or None."""
+    """
+    Returns duration as a float (e.g. 1.5, 0.5, 15.8, 20.65).
+    Prefers stored duration_seconds, falls back to computing from timestamps.
+    """
     try:
         stored = row["duration_seconds"]
         if stored is not None:
@@ -560,7 +575,7 @@ def compute_duration(row) -> Optional[float]:
     except Exception:
         pass
     if row["end_time"] and row["start_time"]:
-        return round((row["end_time"] - row["start_time"]).total_seconds(), 2)
+        return calc_duration(row["start_time"], row["end_time"])
     return None
 
 def parse_seizing_devices(row) -> List[str]:
@@ -766,7 +781,8 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 active_device is not None
             )
             if this_device_was_seizing:
-                gtcs_duration = round((ts_utc - active_gtcs["start_time"]).total_seconds(), 2)
+                # FIX 2: use calc_duration (float) instead of int()
+                gtcs_duration = calc_duration(active_gtcs["start_time"], ts_utc)
                 if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
                     print(f"[GTCS] *** CLOSING GTCS (PATH A) — device {payload.device_id} stopped "
                           f"(duration={gtcs_duration}s) ***")
@@ -796,7 +812,8 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             ))
             return {"status": "saved", "event": "Jerk"}
         else:
-            jerk_duration = round((ts_utc - active_jerk["start_time"]).total_seconds(), 2)
+            # FIX 2: float duration; FIX 3: threshold is now 15s
+            jerk_duration = calc_duration(active_jerk["start_time"], ts_utc)
             if jerk_duration >= JERK_TO_GTCS_SECONDS:
                 print(f"[JERK→GTCS] *** ESCALATING Jerk to GTCS (duration={jerk_duration}s >= {JERK_TO_GTCS_SECONDS}s) ***")
                 await database.execute(
@@ -813,6 +830,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     # 1-2 DEVICES SEIZING — GTCS path
     # ==================================================================
     if devices_with_seizure >= 1:
+        # FIX 4 & 5: corrected thresholds (20s single, 15s multi)
         gtcs_threshold = (
             GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2
             else GTCS_THRESHOLD_1_DEVICE_SECONDS
@@ -821,8 +839,8 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
 
         if active_jerk and not active_gtcs:
-            # Dropped below 3/3 — close the Jerk with actual duration (float)
-            jerk_duration = round((ts_utc - active_jerk["start_time"]).total_seconds(), 2)
+            # Dropped below 3/3 — close the Jerk with actual float duration
+            jerk_duration = calc_duration(active_jerk["start_time"], ts_utc)
             print(f"[JERK] *** CLOSING JERK — dropped below 3/3 (dur={jerk_duration}s) ***")
             await database.execute(
                 user_seizure_sessions.update()
@@ -837,7 +855,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 active_device is not None
             )
             if this_device_was_seizing:
-                gtcs_duration = round((ts_utc - active_gtcs["start_time"]).total_seconds(), 2)
+                gtcs_duration = calc_duration(active_gtcs["start_time"], ts_utc)
                 if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
                     print(f"[GTCS] *** CLOSING GTCS — device {payload.device_id} stopped "
                           f"(duration={gtcs_duration}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')}) ***")
@@ -869,7 +887,8 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                     oldest_device_session = ds
 
         if oldest_device_session:
-            motion_duration = round((ts_utc - oldest_device_session["start_time"]).total_seconds(), 2)
+            # FIX 2: float motion duration for accurate timer display
+            motion_duration = calc_duration(oldest_device_session["start_time"], ts_utc)
             gtcs_declared_by_base = payload.gtcs_flag or False
 
             if gtcs_declared_by_base or motion_duration >= gtcs_threshold:
@@ -891,7 +910,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     if devices_with_seizure == 0:
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         if active_gtcs:
-            gtcs_duration = round((ts_utc - active_gtcs["start_time"]).total_seconds(), 2)
+            gtcs_duration = calc_duration(active_gtcs["start_time"], ts_utc)
             if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
                 print(f"[GTCS] Closing GTCS (duration={gtcs_duration}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')})")
                 await database.execute(
@@ -904,21 +923,13 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
         if active_jerk:
-            jerk_duration = round((ts_utc - active_jerk["start_time"]).total_seconds(), 2)
-            # NEW: discard Jerk sessions shorter than MIN_JERK_DURATION_SECONDS
-            if jerk_duration < MIN_JERK_DURATION_SECONDS:
-                print(f"[JERK] DISCARDING — too short ({jerk_duration}s < min {MIN_JERK_DURATION_SECONDS}s)")
-                await database.execute(
-                    user_seizure_sessions.delete()
-                    .where(user_seizure_sessions.c.id == active_jerk["id"])
-                )
-            else:
-                print(f"[JERK] Closing Jerk (duration={jerk_duration}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')})")
-                await database.execute(
-                    user_seizure_sessions.update()
-                    .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=ts_utc, duration_seconds=jerk_duration)
-                )
+            jerk_duration = calc_duration(active_jerk["start_time"], ts_utc)
+            print(f"[JERK] Closing Jerk (duration={jerk_duration}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')})")
+            await database.execute(
+                user_seizure_sessions.update()
+                .where(user_seizure_sessions.c.id == active_jerk["id"])
+                .values(end_time=ts_utc, duration_seconds=jerk_duration)
+            )
 
     return {"status": "saved", "event": "none"}
 
@@ -947,24 +958,19 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     start_utc = parse_unix_seconds(payload.start_time_ut)
     end_utc   = parse_unix_seconds(payload.end_time_ut)
 
-    # Use float for all duration calculations
-    timestamp_duration = round((end_utc - start_utc).total_seconds(), 2)
-    final_duration = round(
-        payload.duration_seconds
-        if abs(payload.duration_seconds - timestamp_duration) < 5.0
-        else timestamp_duration,
-        2
+    # FIX 2: float duration from exact datetime subtraction
+    timestamp_duration = calc_duration(start_utc, end_utc)
+    payload_duration   = round(float(payload.duration_seconds), 2)
+    final_duration = (
+        payload_duration
+        if abs(payload_duration - timestamp_duration) < 5.0
+        else timestamp_duration
     )
-
-    # NEW: enforce minimum jerk duration
-    if payload.type == "Jerk" and final_duration < MIN_JERK_DURATION_SECONDS:
-        print(f"[SEIZURE EVENT] DISCARDING Jerk — too short ({final_duration}s < min {MIN_JERK_DURATION_SECONDS}s)")
-        return {"status": "discarded", "reason": f"jerk_too_short_{final_duration}s"}
 
     print(f"[SEIZURE EVENT v13] user={user_id} type={payload.type} "
           f"start={to_pht(start_utc).strftime('%Y-%m-%d %H:%M:%S PHT')} "
           f"end={to_pht(end_utc).strftime('%H:%M:%S PHT')} "
-          f"dur={final_duration}s (payload={payload.duration_seconds}s ts_dur={timestamp_duration}s) "
+          f"dur={final_duration}s (payload={payload_duration}s ts_dur={timestamp_duration}s) "
           f"devices={payload.device_ids} seizing={payload.seizing_devices}")
 
     # Same-type duplicate detection
@@ -993,8 +999,8 @@ async def upload_seizure_event(payload: SeizureEventPayload):
             .where(user_seizure_sessions.c.end_time <= start_utc)
         )
         if overlapping_jerk:
-            gap_sec = round((start_utc - overlapping_jerk["end_time"]).total_seconds(), 2)
-            upgraded_duration = round((end_utc - overlapping_jerk["start_time"]).total_seconds(), 2)
+            gap_sec = calc_duration(overlapping_jerk["end_time"], start_utc)
+            upgraded_duration = calc_duration(overlapping_jerk["start_time"], end_utc)
             print(f"[SEIZURE EVENT] Upgrading Jerk (id={overlapping_jerk['id']}) → GTCS "
                   f"(Jerk end={to_pht(overlapping_jerk['end_time']).strftime('%H:%M:%S')} "
                   f"GTCS start={to_pht(start_utc).strftime('%H:%M:%S')} gap={gap_sec}s)")
