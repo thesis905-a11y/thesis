@@ -235,7 +235,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend — Base-Station Detection v13")
+app = FastAPI(title="Seizure Monitor Backend — Base-Station Detection v14")
 
 app.add_middleware(
     CORSMiddleware,
@@ -273,7 +273,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running — Base-Station Detection v13"}
+    return {"message": "Backend running — Base-Station Detection v14"}
 
 
 # =====================================================================
@@ -611,16 +611,8 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         seizure_flag=payload.seizure_flag
     ))
 
-    await database.execute(device_data.insert().values(
-        device_id=payload.device_id,
-        timestamp=ts_utc,
-        payload=json.dumps({
-            "accel_x": payload.accel_x, "accel_y": payload.accel_y, "accel_z": payload.accel_z,
-            "gyro_x": payload.gyro_x, "gyro_y": payload.gyro_y, "gyro_z": payload.gyro_z,
-            "battery_percent": payload.battery_percent,
-            "seizure_flag": payload.seizure_flag,
-        })
-    ))
+    # NOTE: device_data insert removed — sensor_data covers all live dashboard
+    # and graph needs. Storing the same row twice was wasteful for a realtime system.
 
     # ----------------------------------------------------------------
     # NO session open/close logic here.
