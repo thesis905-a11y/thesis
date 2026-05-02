@@ -545,15 +545,32 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 # SEIZURE EVENTS — READ ENDPOINTS
 # =====================================================================
 def compute_duration(row) -> Optional[float]:
-    """Returns float duration (decimal seconds)."""
+    """Returns float duration (decimal seconds).
+    Always prefers the stored duration_seconds (which has sub-second precision).
+    Falls back to timestamp diff only when duration_seconds is truly absent.
+    Never returns 0.0 when duration_seconds > 0.
+    """
+    try:
+        stored = row["duration_seconds"]
+        if stored is not None:
+            val = round(float(stored), 2)
+            # Guard against corrupted 0 when we know end > start
+            if val > 0:
+                return val
+    except Exception:
+        pass
+    # Fallback: use timestamp diff (second-resolution, acceptable for GTCS)
+    if row["end_time"] and row["start_time"]:
+        diff = (row["end_time"] - row["start_time"]).total_seconds()
+        if diff > 0:
+            return round(diff, 2)
+    # Last resort: if duration_seconds exists but was 0, still return it
     try:
         stored = row["duration_seconds"]
         if stored is not None:
             return round(float(stored), 2)
     except Exception:
         pass
-    if row["end_time"] and row["start_time"]:
-        return round((row["end_time"] - row["start_time"]).total_seconds(), 2)
     return None
 
 def parse_seizing_devices(row) -> List[str]:
@@ -872,9 +889,8 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     start_utc = parse_unix_seconds(payload.start_time_ut)
     end_utc   = parse_unix_seconds(payload.end_time_ut)
 
-    # Use the base station's computed duration (float, decimal seconds).
-    # The end_time_ut is only second-resolution (Unix timestamp), so
-    # recompute end_utc from start + duration for sub-second accuracy.
+    # Use the base station's computed duration (float, decimal seconds)
+    # Only fall back to timestamp diff if wildly off
     timestamp_duration = (end_utc - start_utc).total_seconds()
     final_duration = float(payload.duration_seconds)
     if abs(final_duration - timestamp_duration) > 5.0:
@@ -882,9 +898,6 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         final_duration = round(timestamp_duration, 2)
     else:
         final_duration = round(final_duration, 2)
-
-    # Recompute end_utc with sub-second precision from start + actual duration
-    end_utc = start_utc + timedelta(seconds=final_duration)
 
     print(f"[SEIZURE EVENT v13] user={user_id} type={payload.type} "
           f"start={to_pht(start_utc).strftime('%Y-%m-%d %H:%M:%S PHT')} "
