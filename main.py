@@ -129,13 +129,12 @@ STALE_SESSION_THRESHOLD_SECONDS     = 120
 MIN_GTCS_DURATION_SECONDS           = 1.0
 
 # =====================================================================
-# THRESHOLDS — aligned with base station v19
+# THRESHOLDS — aligned with base station v20
 # Jerk:         resolved entirely on base station, backend just stores
-# GTCS:         2+ devices = 30s, 1 device = 15s
+# GTCS:         2+ devices = 30s  (1 device alone never triggers GTCS)
 # Jerk→GTCS:   30s (base station escalates, backend mirrors for live path)
 # =====================================================================
-GTCS_THRESHOLD_1_DEVICE_SECONDS     = 15.0   # 1 device sustained motion
-GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 30.0   # 2+ devices sustained motion
+GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 30.0   # 2+ devices sustained motion (only threshold)
 JERK_TO_GTCS_SECONDS                = 30.0   # jerk escalation to GTCS
 
 SAME_TYPE_DEDUP_WINDOW_SECONDS      = 3   # sensors for same jerk arrive within ~300ms; 3s is safe margin
@@ -830,16 +829,12 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     # Check if base station already declared GTCS
     gtcs_declared_by_base = payload.gtcs_flag or False
 
-    # Determine GTCS threshold based on seizing device count
-    # 2+ devices: 30s | 1 device: 15s
-    gtcs_threshold = (
-        GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2
-        else GTCS_THRESHOLD_1_DEVICE_SECONDS
-    )
+    # GTCS requires 2+ devices — single device alone never triggers GTCS
+    gtcs_threshold = GTCS_THRESHOLD_MULTI_DEVICE_SECONDS
 
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
 
-    if devices_with_seizure >= 1:
+    if devices_with_seizure >= 2:
         if active_gtcs:
             # GTCS already running — check if this device stopping closes it
             this_device_was_seizing = (
@@ -1011,17 +1006,23 @@ async def upload_seizure_event(payload: SeizureEventPayload):
             .where(user_seizure_sessions.c.end_time <= start_utc)
         )
         if overlapping_jerk:
+            jerk_start = overlapping_jerk["start_time"]
             gap_sec = (start_utc - overlapping_jerk["end_time"]).total_seconds()
-            combined_duration = round((end_utc - overlapping_jerk["start_time"]).total_seconds(), 2)
-            print(f"[SEIZURE EVENT] Upgrading Jerk (id={overlapping_jerk['id']}) → GTCS "
-                  f"(gap={gap_sec:.1f}s combined_dur={combined_duration}s)")
+            combined_duration = round((end_utc - jerk_start).total_seconds(), 2)
             seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
+            print(f"[SEIZURE EVENT] Jerk→GTCS: deleting Jerk id={overlapping_jerk['id']} "
+                  f"(gap={gap_sec:.1f}s) then inserting clean GTCS (dur={combined_duration}s)")
+            # Step 1: delete the Jerk row entirely — never rename it
             await database.execute(
-                user_seizure_sessions.update()
+                user_seizure_sessions.delete()
                 .where(user_seizure_sessions.c.id == overlapping_jerk["id"])
-                .values(
+            )
+            # Step 2: insert a brand-new GTCS row anchored to the original Jerk start
+            await database.execute(
+                user_seizure_sessions.insert().values(
+                    user_id=user_id,
                     type="GTCS",
-                    start_time=overlapping_jerk["start_time"],
+                    start_time=jerk_start,
                     end_time=end_utc,
                     duration_seconds=combined_duration,
                     seizing_devices=seizing_json,
@@ -1031,7 +1032,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
                 "status": "upgraded",
                 "event": "Jerk_to_GTCS",
                 "duration_seconds": combined_duration,
-                "start_pht": ts_pht_iso(overlapping_jerk["start_time"]),
+                "start_pht": ts_pht_iso(jerk_start),
                 "end_pht": ts_pht_iso(end_utc),
                 "seizing_devices": payload.seizing_devices,
             }
