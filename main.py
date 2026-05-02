@@ -360,50 +360,6 @@ async def startup():
         )
     print(f"[STARTUP] Cleaned {len(stale_device)} device + {len(stale_user)} user stale sessions")
 
-    # -------------------------------------------------------
-    # MIGRATION: fix rows where duration_seconds was saved as
-    # a whole integer (e.g. 1, 2, 3) but end_time - start_time
-    # is exactly 1s — these are almost certainly sub-second
-    # events that got rounded by the old backend.
-    # We cannot recover the true decimal, but we flag them so
-    # the frontend shows the timestamp-diff value instead of a
-    # misleading integer. We mark them NULL so compute_duration
-    # falls through to the timestamp diff path.
-    # NOTE: Only touch rows where duration == 1 AND ts_diff == 1
-    # (the most common rounding victim). Leave longer ones alone.
-    # -------------------------------------------------------
-    bad_rows = await database.fetch_all(
-        user_seizure_sessions.select()
-        .where(user_seizure_sessions.c.end_time != None)
-    )
-    fixed_count = 0
-    for row in bad_rows:
-        dur = row["duration_seconds"]
-        if dur is None:
-            continue
-        dur_f = float(dur)
-        # Only fix rows that are exactly a whole second (likely rounded)
-        if dur_f != int(dur_f):
-            continue  # already has decimal — correct
-        ts_diff = (row["end_time"] - row["start_time"]).total_seconds()
-        # If duration == ts_diff and both are small whole numbers,
-        # the decimal was lost. Set duration_seconds = ts_diff (same value)
-        # but as a float so at least it's consistent.
-        # More importantly: if ts_diff is 1s but duration is 1 (rounded from <1s),
-        # we CANNOT recover — but we can null it out so frontend shows "< 1 sec"
-        # via the timestamp diff path (which also returns 1.0... same problem).
-        # Best we can do: leave as-is but ensure it's stored as float.
-        if dur_f != ts_diff and abs(dur_f - ts_diff) <= 1.0:
-            # Duration was rounded differently from ts — set to ts_diff
-            await database.execute(
-                user_seizure_sessions.update()
-                .where(user_seizure_sessions.c.id == row["id"])
-                .values(duration_seconds=round(ts_diff, 2))
-            )
-            fixed_count += 1
-    if fixed_count:
-        print(f"[STARTUP MIGRATION] Fixed {fixed_count} rows with mismatched whole-second durations")
-
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
@@ -590,33 +546,25 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 # =====================================================================
 def compute_duration(row) -> Optional[float]:
     """Returns float duration (decimal seconds).
-    Always prefers stored duration_seconds (sub-second precision).
-    Returns a negative sentinel (-1.0) when duration is a whole number that
-    equals the timestamp diff — meaning it was likely rounded by the old backend
-    and the true sub-second value was lost. The API layer converts this to a
-    special marker so the frontend can display '~Xs' instead of 'Xs'.
+    Always prefers the stored duration_seconds (which has sub-second precision).
+    Falls back to timestamp diff only when duration_seconds is truly absent.
+    Never returns 0.0 when duration_seconds > 0.
     """
     try:
         stored = row["duration_seconds"]
         if stored is not None:
             val = round(float(stored), 2)
+            # Guard against corrupted 0 when we know end > start
             if val > 0:
-                # Check if this is a whole-number duration that matches timestamp diff
-                # (sign that it was rounded by old code, not a true measured duration)
-                is_whole = (val == int(val))
-                if is_whole and row["end_time"] and row["start_time"]:
-                    ts_diff = round((row["end_time"] - row["start_time"]).total_seconds(), 2)
-                    if abs(val - ts_diff) < 0.01:
-                        # Ambiguous — could be true 1s or rounded 0.x s
-                        # Return as negative to signal "approximate"
-                        return -val
                 return val
     except Exception:
         pass
+    # Fallback: use timestamp diff (second-resolution, acceptable for GTCS)
     if row["end_time"] and row["start_time"]:
         diff = (row["end_time"] - row["start_time"]).total_seconds()
         if diff > 0:
             return round(diff, 2)
+    # Last resort: if duration_seconds exists but was 0, still return it
     try:
         stored = row["duration_seconds"]
         if stored is not None:
