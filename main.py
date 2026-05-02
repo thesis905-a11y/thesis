@@ -316,7 +316,7 @@ app.add_middleware(
 async def startup():
     await database.connect()
 
-    # Migrate duration_seconds to Float if it was Integer before
+    # Step 1 — Add columns if they don't exist yet
     for col_sql, col_name in [
         ("ALTER TABLE user_seizure_sessions ADD COLUMN duration_seconds REAL", "duration_seconds"),
         ("ALTER TABLE user_seizure_sessions ADD COLUMN seizing_devices TEXT", "seizing_devices"),
@@ -326,6 +326,22 @@ async def startup():
             print(f"[STARTUP] Added column: {col_name}")
         except Exception as e:
             print(f"[STARTUP] Column '{col_name}' already exists (ok): {type(e).__name__}")
+
+    # Step 2 — CRITICAL: ensure duration_seconds is REAL/FLOAT, not INTEGER.
+    # If the column was previously created as INTEGER (e.g. from an older deploy),
+    # floats like 0.75 get truncated to 0 or 1 on every INSERT/UPDATE.
+    # PostgreSQL requires ALTER COLUMN ... TYPE to change it.
+    # SQLite does not support this but is type-flexible by nature, so we skip.
+    if not DATABASE_URL.startswith("sqlite"):
+        try:
+            await database.execute(
+                "ALTER TABLE user_seizure_sessions "
+                "ALTER COLUMN duration_seconds TYPE DOUBLE PRECISION"
+            )
+            print("[STARTUP] duration_seconds column type confirmed/converted to DOUBLE PRECISION")
+        except Exception as e:
+            # Already DOUBLE PRECISION or unsupported — both are fine
+            print(f"[STARTUP] duration_seconds type alter (ok to ignore): {type(e).__name__}: {e}")
 
     print("[STARTUP] Checking for stale open sessions...")
     now_utc = datetime.now(timezone.utc)
@@ -384,6 +400,22 @@ async def startup():
             backfill_count += 1
     if backfill_count:
         print(f"[STARTUP] Backfilled duration_seconds for {backfill_count} rows")
+
+    # Step 4 — Diagnostic: log a sample of recent Jerk rows so we can confirm
+    # duration_seconds is being stored as float, not truncated integer.
+    try:
+        sample = await database.fetch_all(
+            user_seizure_sessions.select()
+            .where(user_seizure_sessions.c.type == "Jerk")
+            .order_by(user_seizure_sessions.c.id.desc())
+            .limit(5)
+        )
+        for row in sample:
+            print(f"[STARTUP DIAG] Jerk id={row['id']} "
+                  f"duration_seconds={row['duration_seconds']!r} "
+                  f"(type={type(row['duration_seconds']).__name__})")
+    except Exception as e:
+        print(f"[STARTUP DIAG] Could not read sample rows: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
