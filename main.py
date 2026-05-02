@@ -105,7 +105,6 @@ device_seizure_sessions = sqlalchemy.Table(
     sqlalchemy.Column("end_time", sqlalchemy.DateTime(timezone=True), nullable=True),
 )
 
-# duration_seconds is Float now to support decimal precision (e.g. 1.5s, 33.6s)
 user_seizure_sessions = sqlalchemy.Table(
     "user_seizure_sessions", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
@@ -113,7 +112,7 @@ user_seizure_sessions = sqlalchemy.Table(
     sqlalchemy.Column("type", sqlalchemy.String),
     sqlalchemy.Column("start_time", sqlalchemy.DateTime(timezone=True)),
     sqlalchemy.Column("end_time", sqlalchemy.DateTime(timezone=True), nullable=True),
-    sqlalchemy.Column("duration_seconds", sqlalchemy.Float, nullable=True),   # <-- Float for decimals
+    sqlalchemy.Column("duration_seconds", sqlalchemy.Float, nullable=True),
     sqlalchemy.Column("seizing_devices", sqlalchemy.Text, nullable=True),
 )
 
@@ -129,16 +128,17 @@ STALE_SESSION_THRESHOLD_SECONDS     = 120
 MIN_GTCS_DURATION_SECONDS           = 1.0
 
 # =====================================================================
-# THRESHOLDS — aligned with base station v19
-# Jerk:         resolved entirely on base station, backend just stores
-# GTCS:         2+ devices = 30s, 1 device = 15s
-# Jerk→GTCS:   30s (base station escalates, backend mirrors for live path)
+# THRESHOLDS — aligned with base station v20
+# Jerk:  resolved entirely on base station, backend just stores.
+# GTCS:  requires 2+ devices simultaneously, 30s sustained motion.
+#        1-device GTCS is DISABLED on both base station and backend.
+# Jerk→GTCS escalation: 30s (base station handles, backend mirrors).
 # =====================================================================
-GTCS_THRESHOLD_1_DEVICE_SECONDS     = 15.0   # 1 device sustained motion
 GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 30.0   # 2+ devices sustained motion
 JERK_TO_GTCS_SECONDS                = 30.0   # jerk escalation to GTCS
+MIN_SEIZING_DEVICES_FOR_GTCS        = 2      # backend enforces 2+ device minimum
 
-SAME_TYPE_DEDUP_WINDOW_SECONDS      = 3   # sensors for same jerk arrive within ~300ms; 3s is safe margin
+SAME_TYPE_DEDUP_WINDOW_SECONDS      = 3
 
 
 # =====================================================================
@@ -206,7 +206,6 @@ class SeizureEventPayload(BaseModel):
     type: str
     start_time_ut: int
     end_time_ut: int
-    # duration_seconds is float — base station sends decimal precision
     duration_seconds: float
     time_valid: Optional[bool] = True
     device_ids: List[str]
@@ -302,7 +301,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend v13 — Jerk on Base, Float Duration")
+app = FastAPI(title="Seizure Monitor Backend v14 — 2+ Device GTCS, No Jerk if Escalated")
 
 app.add_middleware(
     CORSMiddleware,
@@ -316,7 +315,6 @@ app.add_middleware(
 async def startup():
     await database.connect()
 
-    # Step 1 — Add columns if they don't exist yet
     for col_sql, col_name in [
         ("ALTER TABLE user_seizure_sessions ADD COLUMN duration_seconds REAL", "duration_seconds"),
         ("ALTER TABLE user_seizure_sessions ADD COLUMN seizing_devices TEXT", "seizing_devices"),
@@ -327,11 +325,6 @@ async def startup():
         except Exception as e:
             print(f"[STARTUP] Column '{col_name}' already exists (ok): {type(e).__name__}")
 
-    # Step 2 — CRITICAL: ensure duration_seconds is REAL/FLOAT, not INTEGER.
-    # If the column was previously created as INTEGER (e.g. from an older deploy),
-    # floats like 0.75 get truncated to 0 or 1 on every INSERT/UPDATE.
-    # PostgreSQL requires ALTER COLUMN ... TYPE to change it.
-    # SQLite does not support this but is type-flexible by nature, so we skip.
     if not DATABASE_URL.startswith("sqlite"):
         try:
             await database.execute(
@@ -340,7 +333,6 @@ async def startup():
             )
             print("[STARTUP] duration_seconds column type confirmed/converted to DOUBLE PRECISION")
         except Exception as e:
-            # Already DOUBLE PRECISION or unsupported — both are fine
             print(f"[STARTUP] duration_seconds type alter (ok to ignore): {type(e).__name__}: {e}")
 
     print("[STARTUP] Checking for stale open sessions...")
@@ -376,13 +368,6 @@ async def startup():
         )
     print(f"[STARTUP] Cleaned {len(stale_device)} device + {len(stale_user)} user stale sessions")
 
-    # -------------------------------------------------------
-    # BACKFILL: fix rows where duration_seconds is NULL but
-    # end_time is set — these show integer seconds in the UI
-    # because compute_duration() falls back to timestamp diff.
-    # For Jerk events we can't recover the decimal, but at
-    # least we store the timestamp diff so it's not NULL.
-    # -------------------------------------------------------
     null_dur_rows = await database.fetch_all(
         user_seizure_sessions.select()
         .where(user_seizure_sessions.c.duration_seconds == None)
@@ -401,8 +386,6 @@ async def startup():
     if backfill_count:
         print(f"[STARTUP] Backfilled duration_seconds for {backfill_count} rows")
 
-    # Step 4 — Diagnostic: log a sample of recent Jerk rows so we can confirm
-    # duration_seconds is being stored as float, not truncated integer.
     try:
         sample = await database.fetch_all(
             user_seizure_sessions.select()
@@ -427,7 +410,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running — Seizure Monitor v13 (Jerk on Base, Float Duration)"}
+    return {"message": "Backend running — Seizure Monitor v14 (2+ Device GTCS, No Jerk if Escalated)"}
 
 
 # =====================================================================
@@ -602,24 +585,14 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 # SEIZURE EVENTS — READ ENDPOINTS
 # =====================================================================
 def compute_duration(row) -> Optional[float]:
-    """Returns float duration (decimal seconds).
-    Always prefers the stored duration_seconds (which has sub-second precision).
-    Falls back to timestamp diff ONLY when duration_seconds is NULL/missing.
-    The timestamp diff is integer-second resolution and must NOT override a
-    valid stored float (e.g. 0.91s would become 1.0s via diff fallback).
-    """
     try:
         stored = row["duration_seconds"]
         if stored is not None:
             val = round(float(stored), 2)
-            # Trust any positive stored value — even sub-second ones like 0.91
             if val > 0:
                 return val
-            # stored is 0 or negative — only use timestamp diff if available
     except Exception:
         pass
-    # Fallback: timestamp diff — integer resolution, only for GTCS (not Jerk)
-    # Use ONLY when duration_seconds is NULL (never stored).
     if row["end_time"] and row["start_time"]:
         diff = (row["end_time"] - row["start_time"]).total_seconds()
         if diff > 0:
@@ -749,11 +722,11 @@ async def get_latest_seizure_event(current_user=Depends(get_current_user)):
 
 # =====================================================================
 # ESP32 UPLOAD — raw sensor reading (realtime keepalive)
-# NOTE: The live /upload path handles GTCS detection only.
-#       Jerk is fully resolved on the base station and arrives via
-#       /upload_seizure_event. The live path no longer starts Jerk
-#       sessions — it just tracks device seizure flags and fires GTCS
-#       when motion is sustained long enough.
+#
+# GTCS live path:
+#   - Requires devices_with_seizure >= MIN_SEIZING_DEVICES_FOR_GTCS (2)
+#   - 1-device sustained motion does NOT open a GTCS session here.
+#   - Jerk is fully resolved on base station via /upload_seizure_event.
 # =====================================================================
 @app.post("/api/device/upload")
 async def upload_device_data(payload: UnifiedESP32Payload):
@@ -823,23 +796,15 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     print(f"[DETECTION] user={user_id} | seizing={devices_with_seizure}/{len(device_ids)} | devices={seizing_device_ids}")
 
     # ==================================================================
-    # GTCS DETECTION — live path (sustained motion, no Jerk logic here)
-    # Jerk is handled entirely by base station via /upload_seizure_event
+    # GTCS DETECTION — live path
+    # Requires MIN_SEIZING_DEVICES_FOR_GTCS (2) devices simultaneously.
+    # Single-device motion is tracked but never opens a GTCS session.
     # ==================================================================
-
-    # Check if base station already declared GTCS
     gtcs_declared_by_base = payload.gtcs_flag or False
-
-    # Determine GTCS threshold based on seizing device count
-    # 2+ devices: 30s | 1 device: 15s
-    gtcs_threshold = (
-        GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2
-        else GTCS_THRESHOLD_1_DEVICE_SECONDS
-    )
 
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
 
-    if devices_with_seizure >= 1:
+    if devices_with_seizure >= MIN_SEIZING_DEVICES_FOR_GTCS:
         if active_gtcs:
             # GTCS already running — check if this device stopping closes it
             this_device_was_seizing = (
@@ -869,7 +834,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             print(f"[GTCS] Active GTCS continuing (seizing={devices_with_seizure})")
             return {"status": "saved", "event": "GTCS"}
 
-        # No active GTCS — check if we should start one
+        # No active GTCS — check if we should start one (need oldest seizing device session)
         oldest_device_session = None
         for did in seizing_device_ids:
             ds = await get_active_device_seizure(did)
@@ -880,8 +845,8 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         if oldest_device_session:
             motion_duration = (ts_utc - oldest_device_session["start_time"]).total_seconds()
 
-            if gtcs_declared_by_base or motion_duration >= gtcs_threshold:
-                reason = "base station declared GTCS" if gtcs_declared_by_base else f"motion={motion_duration:.2f}s >= {gtcs_threshold}s"
+            if gtcs_declared_by_base or motion_duration >= GTCS_THRESHOLD_MULTI_DEVICE_SECONDS:
+                reason = "base station declared GTCS" if gtcs_declared_by_base else f"motion={motion_duration:.2f}s >= {GTCS_THRESHOLD_MULTI_DEVICE_SECONDS}s"
                 print(f"[GTCS] *** DIRECT GTCS TRIGGERED ({reason}, seizing={devices_with_seizure}) ***")
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id, type="GTCS",
@@ -890,36 +855,42 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 ))
                 return {"status": "saved", "event": "GTCS"}
             else:
-                print(f"[GTCS] Timer running — {motion_duration:.2f}s / {gtcs_threshold}s (seizing={devices_with_seizure})")
+                print(f"[GTCS] Timer running — {motion_duration:.2f}s / {GTCS_THRESHOLD_MULTI_DEVICE_SECONDS}s (seizing={devices_with_seizure})")
 
         return {"status": "saved", "event": "none"}
 
     # ==================================================================
-    # 0 DEVICES SEIZING — close any open GTCS sessions
+    # < MIN_SEIZING_DEVICES_FOR_GTCS — log and close GTCS if open
     # ==================================================================
-    if devices_with_seizure == 0:
-        active_gtcs = await get_active_user_seizure(user_id, "GTCS")
-        if active_gtcs:
-            gtcs_duration = (ts_utc - active_gtcs["start_time"]).total_seconds()
-            if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
-                print(f"[GTCS] Closing GTCS (duration={gtcs_duration:.2f}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')})")
-                await database.execute(
-                    user_seizure_sessions.update()
-                    .where(user_seizure_sessions.c.id == active_gtcs["id"])
-                    .values(end_time=ts_utc, duration_seconds=round(gtcs_duration, 2))
-                )
-            else:
-                print(f"[GTCS] Keeping GTCS open (duration={gtcs_duration:.2f}s < min {MIN_GTCS_DURATION_SECONDS}s)")
-
-        # NOTE: No Jerk closing here — Jerk is resolved on base station
-        # and arrives via /upload_seizure_event with correct decimal duration
+    if devices_with_seizure < MIN_SEIZING_DEVICES_FOR_GTCS:
+        if devices_with_seizure == 1:
+            print(f"[GTCS] Only 1 device seizing — waiting for 2+ before opening GTCS")
+        # Close any open GTCS if all devices have stopped
+        if devices_with_seizure == 0:
+            active_gtcs = await get_active_user_seizure(user_id, "GTCS")
+            if active_gtcs:
+                gtcs_duration = (ts_utc - active_gtcs["start_time"]).total_seconds()
+                if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
+                    print(f"[GTCS] Closing GTCS (duration={gtcs_duration:.2f}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')})")
+                    await database.execute(
+                        user_seizure_sessions.update()
+                        .where(user_seizure_sessions.c.id == active_gtcs["id"])
+                        .values(end_time=ts_utc, duration_seconds=round(gtcs_duration, 2))
+                    )
+                else:
+                    print(f"[GTCS] Keeping GTCS open (duration={gtcs_duration:.2f}s < min {MIN_GTCS_DURATION_SECONDS}s)")
 
     return {"status": "saved", "event": "none"}
 
 
 # =====================================================================
-# ESP32 UPLOAD — seizure event from base station (Jerk resolved there)
-# Accepts float duration_seconds for decimal precision
+# ESP32 UPLOAD — seizure event from base station
+# Jerk: already 3-device confirmed on base station.
+# GTCS: may arrive from base station directly or via Jerk escalation.
+#
+# ENFORCEMENT: If a "GTCS" arrives with seizing_devices < 2,
+# it is rejected — this should not happen with v20 base station
+# but acts as a safety net.
 # =====================================================================
 @app.post("/api/device/upload_seizure_event")
 async def upload_seizure_event(payload: SeizureEventPayload):
@@ -939,23 +910,24 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         print(f"[SEIZURE EVENT] REJECTED — time_valid=False (boot-relative timestamps)")
         return {"status": "rejected", "reason": "boot_relative_timestamps_not_accepted"}
 
+    # Safety net: GTCS events must have 2+ seizing devices
+    if payload.type == "GTCS" and len(payload.seizing_devices) < MIN_SEIZING_DEVICES_FOR_GTCS:
+        print(f"[SEIZURE EVENT] REJECTED — GTCS with only {len(payload.seizing_devices)} seizing device(s) "
+              f"(need >= {MIN_SEIZING_DEVICES_FOR_GTCS})")
+        return {"status": "rejected", "reason": f"gtcs_requires_{MIN_SEIZING_DEVICES_FOR_GTCS}_or_more_seizing_devices"}
+
     start_utc = parse_unix_seconds(payload.start_time_ut)
     end_utc   = parse_unix_seconds(payload.end_time_ut)
 
-    # Use the base station's computed duration (float, decimal seconds).
-    # The payload float is always more precise than timestamp diff (which is
-    # integer-second resolution). Only fall back to timestamp diff if the
-    # payload value is clearly wrong (negative or more than 2s off).
     timestamp_duration = (end_utc - start_utc).total_seconds()
     payload_float = float(payload.duration_seconds)
     if payload_float <= 0 or abs(payload_float - timestamp_duration) > 2.0:
-        # Payload looks wrong — use timestamp diff as fallback
         final_duration = round(timestamp_duration, 2)
         print(f"[SEIZURE EVENT] Using ts_dur fallback: payload={payload_float}s ts={timestamp_duration}s")
     else:
         final_duration = round(payload_float, 2)
 
-    print(f"[SEIZURE EVENT v13] user={user_id} type={payload.type} "
+    print(f"[SEIZURE EVENT v14] user={user_id} type={payload.type} "
           f"start={to_pht(start_utc).strftime('%Y-%m-%d %H:%M:%S PHT')} "
           f"end={to_pht(end_utc).strftime('%H:%M:%S PHT')} "
           f"dur={final_duration}s (payload={payload.duration_seconds}s ts_dur={timestamp_duration:.2f}s) "
@@ -974,13 +946,6 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         existing_dur = existing_same_type["duration_seconds"]
         existing_float = float(existing_dur) if existing_dur is not None else None
 
-        # Only update if:
-        #   1. No duration stored yet (NULL) — store whatever we have, OR
-        #   2. New duration is LONGER than stored — the sensor that latched
-        #      longest caught the most motion, so take the max.
-        # NEVER update if new duration is shorter — that would corrupt the
-        # stored value with a less-complete measurement.
-        # NEVER "add" durations — always REPLACE.
         new_is_better = (
             existing_float is None or
             round(final_duration, 2) > round(existing_float, 2)
@@ -999,7 +964,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
               f"(id={existing_same_type['id']})")
         return {"status": "duplicate", "event": payload.type}
 
-    # Jerk→GTCS upgrade (base station sends "GTCS" after 30s jerk)
+    # Jerk→GTCS upgrade
     if payload.type == "GTCS":
         jerk_upgrade_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
         overlapping_jerk = await database.fetch_one(
@@ -1036,7 +1001,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
                 "seizing_devices": payload.seizing_devices,
             }
 
-    # Insert as new event (Jerk with decimal duration, or GTCS)
+    # Insert as new event
     seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
 
     await database.execute(
@@ -1050,7 +1015,6 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         )
     )
 
-    # Store sensor/window data for graph display
     if payload.window_data:
         for dev_idx, wd in enumerate(payload.window_data):
             dev = await database.fetch_one(
