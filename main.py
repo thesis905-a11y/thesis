@@ -360,6 +360,31 @@ async def startup():
         )
     print(f"[STARTUP] Cleaned {len(stale_device)} device + {len(stale_user)} user stale sessions")
 
+    # -------------------------------------------------------
+    # BACKFILL: fix rows where duration_seconds is NULL but
+    # end_time is set — these show integer seconds in the UI
+    # because compute_duration() falls back to timestamp diff.
+    # For Jerk events we can't recover the decimal, but at
+    # least we store the timestamp diff so it's not NULL.
+    # -------------------------------------------------------
+    null_dur_rows = await database.fetch_all(
+        user_seizure_sessions.select()
+        .where(user_seizure_sessions.c.duration_seconds == None)
+        .where(user_seizure_sessions.c.end_time != None)
+    )
+    backfill_count = 0
+    for row in null_dur_rows:
+        diff = (row["end_time"] - row["start_time"]).total_seconds()
+        if diff > 0:
+            await database.execute(
+                user_seizure_sessions.update()
+                .where(user_seizure_sessions.c.id == row["id"])
+                .values(duration_seconds=round(diff, 2))
+            )
+            backfill_count += 1
+    if backfill_count:
+        print(f"[STARTUP] Backfilled duration_seconds for {backfill_count} rows")
+
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
@@ -547,30 +572,26 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 def compute_duration(row) -> Optional[float]:
     """Returns float duration (decimal seconds).
     Always prefers the stored duration_seconds (which has sub-second precision).
-    Falls back to timestamp diff only when duration_seconds is truly absent.
-    Never returns 0.0 when duration_seconds > 0.
+    Falls back to timestamp diff ONLY when duration_seconds is NULL/missing.
+    The timestamp diff is integer-second resolution and must NOT override a
+    valid stored float (e.g. 0.91s would become 1.0s via diff fallback).
     """
     try:
         stored = row["duration_seconds"]
         if stored is not None:
             val = round(float(stored), 2)
-            # Guard against corrupted 0 when we know end > start
+            # Trust any positive stored value — even sub-second ones like 0.91
             if val > 0:
                 return val
+            # stored is 0 or negative — only use timestamp diff if available
     except Exception:
         pass
-    # Fallback: use timestamp diff (second-resolution, acceptable for GTCS)
+    # Fallback: timestamp diff — integer resolution, only for GTCS (not Jerk)
+    # Use ONLY when duration_seconds is NULL (never stored).
     if row["end_time"] and row["start_time"]:
         diff = (row["end_time"] - row["start_time"]).total_seconds()
         if diff > 0:
             return round(diff, 2)
-    # Last resort: if duration_seconds exists but was 0, still return it
-    try:
-        stored = row["duration_seconds"]
-        if stored is not None:
-            return round(float(stored), 2)
-    except Exception:
-        pass
     return None
 
 def parse_seizing_devices(row) -> List[str]:
@@ -916,15 +937,14 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     )
     if existing_same_type:
         existing_dur = existing_same_type["duration_seconds"]
-        # If the new payload has a better (more precise, non-integer) duration, update the row.
-        # This fixes the case where an old row was saved as integer seconds (e.g. 2.0)
-        # and a new upload arrives with the true decimal duration (e.g. 1.8).
+        # Update if:
+        #   1. No duration stored yet (NULL), OR
+        #   2. New float duration differs from stored (e.g. 1.34 vs 1.0 integer fallback), OR
+        #   3. Stored duration is a whole number but new one is not (sub-second precision gained)
+        existing_float = float(existing_dur) if existing_dur is not None else None
         new_is_better = (
-            existing_dur is None or
-            (existing_dur is not None and
-             round(final_duration, 2) != round(float(existing_dur), 2) and
-             # New value is more precise: not a whole number, or closer to payload
-             (final_duration != int(final_duration) or existing_dur == int(existing_dur)))
+            existing_float is None or
+            round(final_duration, 2) != round(existing_float, 2)
         )
         if new_is_better:
             better_end = start_utc + timedelta(seconds=final_duration)
