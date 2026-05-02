@@ -872,8 +872,9 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     start_utc = parse_unix_seconds(payload.start_time_ut)
     end_utc   = parse_unix_seconds(payload.end_time_ut)
 
-    # Use the base station's computed duration (float, decimal seconds)
-    # Only fall back to timestamp diff if wildly off
+    # Use the base station's computed duration (float, decimal seconds).
+    # The end_time_ut is only second-resolution (Unix timestamp), so
+    # recompute end_utc from start + duration for sub-second accuracy.
     timestamp_duration = (end_utc - start_utc).total_seconds()
     final_duration = float(payload.duration_seconds)
     if abs(final_duration - timestamp_duration) > 5.0:
@@ -881,6 +882,9 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         final_duration = round(timestamp_duration, 2)
     else:
         final_duration = round(final_duration, 2)
+
+    # Recompute end_utc with sub-second precision from start + actual duration
+    end_utc = start_utc + timedelta(seconds=final_duration)
 
     print(f"[SEIZURE EVENT v13] user={user_id} type={payload.type} "
           f"start={to_pht(start_utc).strftime('%Y-%m-%d %H:%M:%S PHT')} "
