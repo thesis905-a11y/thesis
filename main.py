@@ -131,10 +131,11 @@ MIN_GTCS_DURATION_SECONDS           = 1.0
 # =====================================================================
 # THRESHOLDS — aligned with base station v19
 # Jerk:         resolved entirely on base station, backend just stores
-# GTCS:         2+ devices ONLY = 30s (1 device alone never triggers GTCS)
+# GTCS:         2+ devices = 30s, 1 device = 15s
 # Jerk→GTCS:   30s (base station escalates, backend mirrors for live path)
 # =====================================================================
-GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 30.0   # 2+ devices sustained motion — ONLY threshold
+GTCS_THRESHOLD_1_DEVICE_SECONDS     = 15.0   # 1 device sustained motion
+GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 30.0   # 2+ devices sustained motion
 JERK_TO_GTCS_SECONDS                = 30.0   # jerk escalation to GTCS
 
 SAME_TYPE_DEDUP_WINDOW_SECONDS      = 3   # sensors for same jerk arrive within ~300ms; 3s is safe margin
@@ -824,18 +825,21 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     # ==================================================================
     # GTCS DETECTION — live path (sustained motion, no Jerk logic here)
     # Jerk is handled entirely by base station via /upload_seizure_event
-    # GTCS requires 2+ devices seizing simultaneously.
     # ==================================================================
 
     # Check if base station already declared GTCS
     gtcs_declared_by_base = payload.gtcs_flag or False
 
-    # Only 2+ devices can trigger GTCS
-    gtcs_threshold = GTCS_THRESHOLD_MULTI_DEVICE_SECONDS
+    # Determine GTCS threshold based on seizing device count
+    # 2+ devices: 30s | 1 device: 15s
+    gtcs_threshold = (
+        GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2
+        else GTCS_THRESHOLD_1_DEVICE_SECONDS
+    )
 
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
 
-    if devices_with_seizure >= 2:  # 2+ devices required
+    if devices_with_seizure >= 1:
         if active_gtcs:
             # GTCS already running — check if this device stopping closes it
             this_device_was_seizing = (
@@ -996,8 +1000,6 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         return {"status": "duplicate", "event": payload.type}
 
     # Jerk→GTCS upgrade (base station sends "GTCS" after 30s jerk)
-    # When a Jerk escalates: DELETE the Jerk row, INSERT a clean GTCS row.
-    # The Jerk is not saved — only the GTCS is kept in history.
     if payload.type == "GTCS":
         jerk_upgrade_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
         overlapping_jerk = await database.fetch_one(
@@ -1006,36 +1008,30 @@ async def upload_seizure_event(payload: SeizureEventPayload):
             .where(user_seizure_sessions.c.type == "Jerk")
             .where(user_seizure_sessions.c.end_time != None)
             .where(user_seizure_sessions.c.end_time >= start_utc - jerk_upgrade_window)
-            .where(user_seizure_sessions.c.end_time <= start_utc + timedelta(seconds=3))
+            .where(user_seizure_sessions.c.end_time <= start_utc)
         )
         if overlapping_jerk:
-            # Combined duration: from Jerk start to GTCS end
-            gtcs_start = overlapping_jerk["start_time"]
-            combined_duration = round((end_utc - gtcs_start).total_seconds(), 2)
+            gap_sec = (start_utc - overlapping_jerk["end_time"]).total_seconds()
+            combined_duration = round((end_utc - overlapping_jerk["start_time"]).total_seconds(), 2)
+            print(f"[SEIZURE EVENT] Upgrading Jerk (id={overlapping_jerk['id']}) → GTCS "
+                  f"(gap={gap_sec:.1f}s combined_dur={combined_duration}s)")
             seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
-            print(f"[SEIZURE EVENT] Jerk→GTCS: deleting Jerk id={overlapping_jerk['id']} "
-                  f"and saving GTCS (combined_dur={combined_duration}s)")
-            # Delete the Jerk row — only GTCS gets saved
             await database.execute(
-                user_seizure_sessions.delete()
+                user_seizure_sessions.update()
                 .where(user_seizure_sessions.c.id == overlapping_jerk["id"])
-            )
-            # Insert clean GTCS with float duration
-            await database.execute(
-                user_seizure_sessions.insert().values(
-                    user_id=user_id,
+                .values(
                     type="GTCS",
-                    start_time=gtcs_start,
+                    start_time=overlapping_jerk["start_time"],
                     end_time=end_utc,
                     duration_seconds=combined_duration,
                     seizing_devices=seizing_json,
                 )
             )
             return {
-                "status": "saved",
-                "event": "GTCS",
+                "status": "upgraded",
+                "event": "Jerk_to_GTCS",
                 "duration_seconds": combined_duration,
-                "start_pht": ts_pht_iso(gtcs_start),
+                "start_pht": ts_pht_iso(overlapping_jerk["start_time"]),
                 "end_pht": ts_pht_iso(end_utc),
                 "seizing_devices": payload.seizing_devices,
             }
