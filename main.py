@@ -138,7 +138,7 @@ GTCS_THRESHOLD_1_DEVICE_SECONDS     = 15.0   # 1 device sustained motion
 GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 30.0   # 2+ devices sustained motion
 JERK_TO_GTCS_SECONDS                = 30.0   # jerk escalation to GTCS
 
-SAME_TYPE_DEDUP_WINDOW_SECONDS      = 10
+SAME_TYPE_DEDUP_WINDOW_SECONDS      = 3   # sensors for same jerk arrive within ~300ms; 3s is safe margin
 
 
 # =====================================================================
@@ -910,15 +910,18 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     start_utc = parse_unix_seconds(payload.start_time_ut)
     end_utc   = parse_unix_seconds(payload.end_time_ut)
 
-    # Use the base station's computed duration (float, decimal seconds)
-    # Only fall back to timestamp diff if wildly off
+    # Use the base station's computed duration (float, decimal seconds).
+    # The payload float is always more precise than timestamp diff (which is
+    # integer-second resolution). Only fall back to timestamp diff if the
+    # payload value is clearly wrong (negative or more than 2s off).
     timestamp_duration = (end_utc - start_utc).total_seconds()
-    final_duration = float(payload.duration_seconds)
-    if abs(final_duration - timestamp_duration) > 5.0:
-        # If they differ by >5s, trust the timestamp diff
+    payload_float = float(payload.duration_seconds)
+    if payload_float <= 0 or abs(payload_float - timestamp_duration) > 2.0:
+        # Payload looks wrong — use timestamp diff as fallback
         final_duration = round(timestamp_duration, 2)
+        print(f"[SEIZURE EVENT] Using ts_dur fallback: payload={payload_float}s ts={timestamp_duration}s")
     else:
-        final_duration = round(final_duration, 2)
+        final_duration = round(payload_float, 2)
 
     print(f"[SEIZURE EVENT v13] user={user_id} type={payload.type} "
           f"start={to_pht(start_utc).strftime('%Y-%m-%d %H:%M:%S PHT')} "
@@ -937,14 +940,18 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     )
     if existing_same_type:
         existing_dur = existing_same_type["duration_seconds"]
-        # Update if:
-        #   1. No duration stored yet (NULL), OR
-        #   2. New float duration differs from stored (e.g. 1.34 vs 1.0 integer fallback), OR
-        #   3. Stored duration is a whole number but new one is not (sub-second precision gained)
         existing_float = float(existing_dur) if existing_dur is not None else None
+
+        # Only update if:
+        #   1. No duration stored yet (NULL) — store whatever we have, OR
+        #   2. New duration is LONGER than stored — the sensor that latched
+        #      longest caught the most motion, so take the max.
+        # NEVER update if new duration is shorter — that would corrupt the
+        # stored value with a less-complete measurement.
+        # NEVER "add" durations — always REPLACE.
         new_is_better = (
             existing_float is None or
-            round(final_duration, 2) != round(existing_float, 2)
+            round(final_duration, 2) > round(existing_float, 2)
         )
         if new_is_better:
             better_end = start_utc + timedelta(seconds=final_duration)
@@ -953,11 +960,11 @@ async def upload_seizure_event(payload: SeizureEventPayload):
                 .where(user_seizure_sessions.c.id == existing_same_type["id"])
                 .values(end_time=better_end, duration_seconds=final_duration)
             )
-            print(f"[SEIZURE EVENT] Duplicate updated with better duration: "
+            print(f"[SEIZURE EVENT] Dedup updated (longer duration): "
                   f"{existing_dur}s → {final_duration}s (id={existing_same_type['id']})")
             return {"status": "updated", "event": payload.type, "duration_seconds": final_duration}
-        print(f"[SEIZURE EVENT] Same-type duplicate detected (id={existing_same_type['id']} "
-              f"type={existing_same_type['type']}) — skipping SD upload of {payload.type}")
+        print(f"[SEIZURE EVENT] Dedup skipped (existing {existing_dur}s >= new {final_duration}s) "
+              f"(id={existing_same_type['id']})")
         return {"status": "duplicate", "event": payload.type}
 
     # Jerk→GTCS upgrade (base station sends "GTCS" after 30s jerk)
