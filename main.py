@@ -915,6 +915,27 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         .where(user_seizure_sessions.c.start_time <= start_utc + same_type_tolerance)
     )
     if existing_same_type:
+        existing_dur = existing_same_type["duration_seconds"]
+        # If the new payload has a better (more precise, non-integer) duration, update the row.
+        # This fixes the case where an old row was saved as integer seconds (e.g. 2.0)
+        # and a new upload arrives with the true decimal duration (e.g. 1.8).
+        new_is_better = (
+            existing_dur is None or
+            (existing_dur is not None and
+             round(final_duration, 2) != round(float(existing_dur), 2) and
+             # New value is more precise: not a whole number, or closer to payload
+             (final_duration != int(final_duration) or existing_dur == int(existing_dur)))
+        )
+        if new_is_better:
+            better_end = start_utc + timedelta(seconds=final_duration)
+            await database.execute(
+                user_seizure_sessions.update()
+                .where(user_seizure_sessions.c.id == existing_same_type["id"])
+                .values(end_time=better_end, duration_seconds=final_duration)
+            )
+            print(f"[SEIZURE EVENT] Duplicate updated with better duration: "
+                  f"{existing_dur}s → {final_duration}s (id={existing_same_type['id']})")
+            return {"status": "updated", "event": payload.type, "duration_seconds": final_duration}
         print(f"[SEIZURE EVENT] Same-type duplicate detected (id={existing_same_type['id']} "
               f"type={existing_same_type['type']}) — skipping SD upload of {payload.type}")
         return {"status": "duplicate", "event": payload.type}
