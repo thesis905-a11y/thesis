@@ -964,6 +964,29 @@ async def upload_seizure_event(payload: SeizureEventPayload):
               f"(id={existing_same_type['id']})")
         return {"status": "duplicate", "event": payload.type}
 
+    # ---------------------------------------------------------------
+    # Jerk suppression: if a GTCS already exists that overlaps this
+    # Jerk's time window (within JERK_TO_GTCS_SECONDS), the Jerk
+    # was escalated — skip saving it to avoid duplicate records.
+    # This covers the offline-replay scenario where the SD queue
+    # contains both a Jerk and a GTCS from the same escalation.
+    # ---------------------------------------------------------------
+    if payload.type == "Jerk":
+        jerk_suppress_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
+        overlapping_gtcs = await database.fetch_one(
+            user_seizure_sessions.select()
+            .where(user_seizure_sessions.c.user_id == user_id)
+            .where(user_seizure_sessions.c.type == "GTCS")
+            .where(user_seizure_sessions.c.start_time <= end_utc + jerk_suppress_window)
+            .where(user_seizure_sessions.c.end_time >= start_utc - jerk_suppress_window)
+        )
+        if overlapping_gtcs:
+            gap_sec = (overlapping_gtcs["start_time"] - start_utc).total_seconds()
+            print(f"[SEIZURE EVENT] Jerk SUPPRESSED — overlapping GTCS id={overlapping_gtcs['id']} "
+                  f"already covers this window (gap={gap_sec:.1f}s). Escalation already recorded.")
+            return {"status": "suppressed", "reason": "jerk_escalated_to_gtcs",
+                    "gtcs_id": overlapping_gtcs["id"]}
+
     # Jerk→GTCS upgrade
     if payload.type == "GTCS":
         jerk_upgrade_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
