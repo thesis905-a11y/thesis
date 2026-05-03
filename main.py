@@ -964,34 +964,6 @@ async def upload_seizure_event(payload: SeizureEventPayload):
               f"(id={existing_same_type['id']})")
         return {"status": "duplicate", "event": payload.type}
 
-    # ---------------------------------------------------------------
-    # Jerk suppression: if a GTCS already exists whose time window
-    # overlaps this Jerk (within JERK_TO_GTCS_SECONDS in either
-    # direction), the Jerk was part of an escalation — suppress it.
-    #
-    # Covers offline SD-replay where GTCS arrived first AND the
-    # case where the Jerk start_time is close to the GTCS start_time
-    # (e.g. Jerk 22:06:34, GTCS 22:06:31 — gap is only 3 seconds).
-    # ---------------------------------------------------------------
-    if payload.type == "Jerk":
-        jerk_suppress_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
-        overlapping_gtcs = await database.fetch_one(
-            user_seizure_sessions.select()
-            .where(user_seizure_sessions.c.user_id == user_id)
-            .where(user_seizure_sessions.c.type == "GTCS")
-            # GTCS starts within 30s before the Jerk ends, OR after Jerk starts
-            .where(user_seizure_sessions.c.start_time <= end_utc + jerk_suppress_window)
-            .where(user_seizure_sessions.c.start_time >= start_utc - jerk_suppress_window)
-        )
-        if overlapping_gtcs:
-            gap_sec = (overlapping_gtcs["start_time"] - start_utc).total_seconds()
-            print(f"[SEIZURE EVENT] Jerk SUPPRESSED — overlapping GTCS id={overlapping_gtcs['id']} "
-                  f"(Jerk start={to_pht(start_utc).strftime('%H:%M:%S')} "
-                  f"GTCS start={to_pht(overlapping_gtcs['start_time']).strftime('%H:%M:%S')} "
-                  f"gap={gap_sec:.1f}s). Escalation already recorded.")
-            return {"status": "suppressed", "reason": "jerk_escalated_to_gtcs",
-                    "gtcs_id": overlapping_gtcs["id"]}
-
     # Jerk→GTCS upgrade
     if payload.type == "GTCS":
         jerk_upgrade_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
