@@ -134,8 +134,8 @@ MIN_GTCS_DURATION_SECONDS           = 1.0
 #        1-device GTCS is DISABLED on both base station and backend.
 # Jerk→GTCS escalation: 30s (base station handles, backend mirrors).
 # =====================================================================
-GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 30.0   # 2+ devices sustained motion
-JERK_TO_GTCS_SECONDS                = 30.0   # jerk escalation to GTCS
+GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 20.0   # 2+ devices sustained motion
+JERK_TO_GTCS_SECONDS                = 20.0   # jerk escalation to GTCS
 MIN_SEIZING_DEVICES_FOR_GTCS        = 2      # backend enforces 2+ device minimum
 
 SAME_TYPE_DEDUP_WINDOW_SECONDS      = 3
