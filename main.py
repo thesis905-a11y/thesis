@@ -134,7 +134,7 @@ MIN_GTCS_DURATION_SECONDS           = 1.0
 #        1-device GTCS is DISABLED on both base station and backend.
 # Jerk→GTCS escalation: 30s (base station handles, backend mirrors).
 # =====================================================================
-GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 20.0   # 2+ devices sustained motion
+GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 20.0   # 2+ devices, 20s sustained motion
 JERK_TO_GTCS_SECONDS                = 20.0   # jerk escalation to GTCS
 MIN_SEIZING_DEVICES_FOR_GTCS        = 2      # backend enforces 2+ device minimum
 
@@ -301,7 +301,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend v14 — 2+ Device GTCS, No Jerk if Escalated")
+app = FastAPI(title="Seizure Monitor Backend v15 — 2+ Device GTCS, 20s Threshold")
 
 app.add_middleware(
     CORSMiddleware,
@@ -410,7 +410,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running — Seizure Monitor v14 (2+ Device GTCS, No Jerk if Escalated)"}
+    return {"message": "Backend running — Seizure Monitor v15 (2+ Device GTCS, 20s Threshold)"}
 
 
 # =====================================================================
