@@ -970,18 +970,13 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     if payload.type == "GTCS":
         jerk_upgrade_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
 
-        # FIX: Removed `.where(user_seizure_sessions.c.end_time != None)` filter.
-        # Previously, open Jerk records (end_time IS NULL, e.g. saved offline mid-escalation)
-        # were invisible to this query and would survive as a Jerk even after GTCS arrived.
-        # Now we upgrade ALL overlapping Jerks — open or closed — to GTCS.
+        # FIX: removed end_time != None filter — open Jerk records must also be upgraded
         overlapping_jerks = await database.fetch_all(
             user_seizure_sessions.select()
             .where(user_seizure_sessions.c.user_id == user_id)
             .where(user_seizure_sessions.c.type == "Jerk")
             .where(user_seizure_sessions.c.start_time <= end_utc + jerk_upgrade_window)
             .where(
-                # Overlap condition: jerk starts before GTCS end, AND
-                # jerk ends after GTCS start (or is still open)
                 sqlalchemy.or_(
                     user_seizure_sessions.c.end_time == None,
                     user_seizure_sessions.c.end_time >= start_utc - jerk_upgrade_window
@@ -1032,7 +1027,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     # overlaps this Jerk's window, reject the Jerk entirely — it already escalated.
     if payload.type == "Jerk":
         jerk_suppress_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
-        # FIX: Use OR condition so open (end_time IS NULL) GTCS records also suppress Jerks.
+        # FIX: OR end_time IS NULL so ongoing GTCS also suppresses late Jerks
         overlapping_gtcs = await database.fetch_one(
             user_seizure_sessions.select()
             .where(user_seizure_sessions.c.user_id == user_id)
