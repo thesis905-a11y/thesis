@@ -128,16 +128,15 @@ STALE_SESSION_THRESHOLD_SECONDS     = 120
 MIN_GTCS_DURATION_SECONDS           = 1.0
 
 # =====================================================================
-# THRESHOLDS — aligned with base station v22
-# Jerk:  0.5s–5.0s enforced on both base station and backend.
-# GTCS:  2+ devices, 20s timer starts ONLY when 2+ devices moving.
-# Jerk→GTCS escalation: 20s.
+# THRESHOLDS — aligned with base station v20
+# Jerk:  resolved entirely on base station, backend just stores.
+# GTCS:  requires 2+ devices simultaneously, 30s sustained motion.
+#        1-device GTCS is DISABLED on both base station and backend.
+# Jerk→GTCS escalation: 30s (base station handles, backend mirrors).
 # =====================================================================
-GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 20.0
-JERK_TO_GTCS_SECONDS                = 20.0
-MIN_SEIZING_DEVICES_FOR_GTCS        = 2
-JERK_MIN_DURATION_SECONDS           = 0.5
-JERK_MAX_DURATION_SECONDS           = 5.0
+GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 20.0   # 2+ devices sustained motion
+JERK_TO_GTCS_SECONDS                = 20.0   # jerk escalation to GTCS
+MIN_SEIZING_DEVICES_FOR_GTCS        = 2      # backend enforces 2+ device minimum
 
 SAME_TYPE_DEDUP_WINDOW_SECONDS      = 3
 
@@ -302,7 +301,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend v15 — v22 Aligned, Jerk 0.5-5s, GTCS Timer Fix, Offline Flood Guard")
+app = FastAPI(title="Seizure Monitor Backend v14 — 2+ Device GTCS, No Jerk if Escalated")
 
 app.add_middleware(
     CORSMiddleware,
@@ -913,17 +912,9 @@ async def upload_seizure_event(payload: SeizureEventPayload):
 
     # Safety net: GTCS events must have 2+ seizing devices
     if payload.type == "GTCS" and len(payload.seizing_devices) < MIN_SEIZING_DEVICES_FOR_GTCS:
-        print(f"[SEIZURE EVENT] REJECTED — GTCS with only {len(payload.seizing_devices)} seizing device(s)")
+        print(f"[SEIZURE EVENT] REJECTED — GTCS with only {len(payload.seizing_devices)} seizing device(s) "
+              f"(need >= {MIN_SEIZING_DEVICES_FOR_GTCS})")
         return {"status": "rejected", "reason": f"gtcs_requires_{MIN_SEIZING_DEVICES_FOR_GTCS}_or_more_seizing_devices"}
-
-    # Jerk duration bounds: 0.5s–5.0s
-    if payload.type == "Jerk":
-        if payload.duration_seconds < JERK_MIN_DURATION_SECONDS:
-            print(f"[SEIZURE EVENT] REJECTED — Jerk too short: {payload.duration_seconds}s < {JERK_MIN_DURATION_SECONDS}s")
-            return {"status": "rejected", "reason": "jerk_duration_too_short"}
-        if payload.duration_seconds > JERK_MAX_DURATION_SECONDS:
-            print(f"[SEIZURE EVENT] REJECTED — Jerk too long: {payload.duration_seconds}s > {JERK_MAX_DURATION_SECONDS}s (should be GTCS)")
-            return {"status": "rejected", "reason": "jerk_duration_exceeds_max"}
 
     start_utc = parse_unix_seconds(payload.start_time_ut)
     end_utc   = parse_unix_seconds(payload.end_time_ut)
@@ -979,13 +970,23 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     if payload.type == "GTCS":
         jerk_upgrade_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
 
+        # FIX: Removed `.where(user_seizure_sessions.c.end_time != None)` filter.
+        # Previously, open Jerk records (end_time IS NULL, e.g. saved offline mid-escalation)
+        # were invisible to this query and would survive as a Jerk even after GTCS arrived.
+        # Now we upgrade ALL overlapping Jerks — open or closed — to GTCS.
         overlapping_jerks = await database.fetch_all(
             user_seizure_sessions.select()
             .where(user_seizure_sessions.c.user_id == user_id)
             .where(user_seizure_sessions.c.type == "Jerk")
-            .where(user_seizure_sessions.c.end_time != None)
-            .where(user_seizure_sessions.c.end_time >= start_utc - jerk_upgrade_window)
             .where(user_seizure_sessions.c.start_time <= end_utc + jerk_upgrade_window)
+            .where(
+                # Overlap condition: jerk starts before GTCS end, AND
+                # jerk ends after GTCS start (or is still open)
+                sqlalchemy.or_(
+                    user_seizure_sessions.c.end_time == None,
+                    user_seizure_sessions.c.end_time >= start_utc - jerk_upgrade_window
+                )
+            )
             .order_by(user_seizure_sessions.c.start_time.asc())
         )
 
@@ -1031,16 +1032,17 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     # overlaps this Jerk's window, reject the Jerk entirely — it already escalated.
     if payload.type == "Jerk":
         jerk_suppress_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
-        # Also catches open GTCS sessions (end_time IS NULL) — if GTCS is still
-        # running when a Jerk arrives, the Jerk should still be suppressed.
+        # FIX: Use OR condition so open (end_time IS NULL) GTCS records also suppress Jerks.
         overlapping_gtcs = await database.fetch_one(
             user_seizure_sessions.select()
             .where(user_seizure_sessions.c.user_id == user_id)
             .where(user_seizure_sessions.c.type == "GTCS")
             .where(user_seizure_sessions.c.start_time <= end_utc + jerk_suppress_window)
             .where(
-                (user_seizure_sessions.c.end_time == None) |
-                (user_seizure_sessions.c.end_time >= start_utc - jerk_suppress_window)
+                sqlalchemy.or_(
+                    user_seizure_sessions.c.end_time == None,
+                    user_seizure_sessions.c.end_time >= start_utc - jerk_suppress_window
+                )
             )
         )
         if overlapping_gtcs:
