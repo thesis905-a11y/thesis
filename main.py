@@ -129,23 +129,16 @@ MIN_GTCS_DURATION_SECONDS           = 1.0
 
 # =====================================================================
 # THRESHOLDS — aligned with base station v22
-# Jerk:  resolved entirely on base station, backend just stores.
-#        Duration bounds: 0.5s min, 5s max enforced on base station.
-# GTCS:  requires 2+ devices simultaneously, 20s sustained motion.
-#        Timer only starts when 2+ devices are moving (base station v22 fix).
-#        1-device GTCS is DISABLED on both base station and backend.
-# Jerk→GTCS escalation: 20s (base station handles, backend mirrors).
-# Offline→Online: base station defers SD queue flush while session active.
+# Jerk:  0.5s–5.0s enforced on both base station and backend.
+# GTCS:  2+ devices, 20s timer starts ONLY when 2+ devices moving.
+# Jerk→GTCS escalation: 20s.
 # =====================================================================
-GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 20.0   # 2+ devices sustained motion
-JERK_TO_GTCS_SECONDS                = 20.0   # jerk escalation to GTCS
-MIN_SEIZING_DEVICES_FOR_GTCS        = 2      # backend enforces 2+ device minimum
+GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 20.0
+JERK_TO_GTCS_SECONDS                = 20.0
+MIN_SEIZING_DEVICES_FOR_GTCS        = 2
+JERK_MIN_DURATION_SECONDS           = 0.5
+JERK_MAX_DURATION_SECONDS           = 5.0
 
-# Dedup window: same-type events within this window of each other are collapsed.
-# Kept at 3s for GTCS (events are uniquely timed).
-# For Jerks, dedup is per start_time — different jerks have different start times
-# so dedup doesn't help with offline floods. That is handled by the base station's
-# deferred flush (won't flush SD queue while a seizure session is active).
 SAME_TYPE_DEDUP_WINDOW_SECONDS      = 3
 
 
@@ -309,7 +302,7 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend v15 — v22 Aligned, GTCS Timer Fix, Offline Flood Guard")
+app = FastAPI(title="Seizure Monitor Backend v15 — v22 Aligned, Jerk 0.5-5s, GTCS Timer Fix, Offline Flood Guard")
 
 app.add_middleware(
     CORSMiddleware,
@@ -920,9 +913,17 @@ async def upload_seizure_event(payload: SeizureEventPayload):
 
     # Safety net: GTCS events must have 2+ seizing devices
     if payload.type == "GTCS" and len(payload.seizing_devices) < MIN_SEIZING_DEVICES_FOR_GTCS:
-        print(f"[SEIZURE EVENT] REJECTED — GTCS with only {len(payload.seizing_devices)} seizing device(s) "
-              f"(need >= {MIN_SEIZING_DEVICES_FOR_GTCS})")
+        print(f"[SEIZURE EVENT] REJECTED — GTCS with only {len(payload.seizing_devices)} seizing device(s)")
         return {"status": "rejected", "reason": f"gtcs_requires_{MIN_SEIZING_DEVICES_FOR_GTCS}_or_more_seizing_devices"}
+
+    # Jerk duration bounds: 0.5s–5.0s
+    if payload.type == "Jerk":
+        if payload.duration_seconds < JERK_MIN_DURATION_SECONDS:
+            print(f"[SEIZURE EVENT] REJECTED — Jerk too short: {payload.duration_seconds}s < {JERK_MIN_DURATION_SECONDS}s")
+            return {"status": "rejected", "reason": "jerk_duration_too_short"}
+        if payload.duration_seconds > JERK_MAX_DURATION_SECONDS:
+            print(f"[SEIZURE EVENT] REJECTED — Jerk too long: {payload.duration_seconds}s > {JERK_MAX_DURATION_SECONDS}s (should be GTCS)")
+            return {"status": "rejected", "reason": "jerk_duration_exceeds_max"}
 
     start_utc = parse_unix_seconds(payload.start_time_ut)
     end_utc   = parse_unix_seconds(payload.end_time_ut)
@@ -1030,12 +1031,17 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     # overlaps this Jerk's window, reject the Jerk entirely — it already escalated.
     if payload.type == "Jerk":
         jerk_suppress_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
+        # Also catches open GTCS sessions (end_time IS NULL) — if GTCS is still
+        # running when a Jerk arrives, the Jerk should still be suppressed.
         overlapping_gtcs = await database.fetch_one(
             user_seizure_sessions.select()
             .where(user_seizure_sessions.c.user_id == user_id)
             .where(user_seizure_sessions.c.type == "GTCS")
             .where(user_seizure_sessions.c.start_time <= end_utc + jerk_suppress_window)
-            .where(user_seizure_sessions.c.end_time >= start_utc - jerk_suppress_window)
+            .where(
+                (user_seizure_sessions.c.end_time == None) |
+                (user_seizure_sessions.c.end_time >= start_utc - jerk_suppress_window)
+            )
         )
         if overlapping_gtcs:
             print(f"[SEIZURE EVENT] SUPPRESSED Jerk — overlapping GTCS (id={overlapping_gtcs['id']}) "
