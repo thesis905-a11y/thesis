@@ -964,13 +964,89 @@ async def upload_seizure_event(payload: SeizureEventPayload):
               f"(id={existing_same_type['id']})")
         return {"status": "duplicate", "event": payload.type}
 
-    # Jerk→GTCS upgrade: when a GTCS arrives, find ALL overlapping Jerk records
-    # within the escalation window, upgrade the earliest to GTCS, and DELETE the rest.
-    # This ensures no Jerk record survives when it escalated to GTCS.
+    # =====================================================================
+    # GTCS DEDUP + LIVE-SESSION MERGE
+    # When a GTCS event arrives from the base station, we need to handle
+    # three scenarios:
+    #   1. A live GTCS session is already open (created by /upload path)
+    #      → Close/update that session with the authoritative end time.
+    #      Then absorb any overlapping Jerk records.
+    #   2. No live GTCS, but overlapping Jerk records exist
+    #      → Upgrade earliest Jerk to GTCS (existing behaviour).
+    #   3. No live GTCS, no Jerks → insert as new record.
+    # This prevents the duplicate GTCS entries seen when the live upload
+    # path opens a GTCS session and then upload_seizure_event creates
+    # a second one via the Jerk upgrade path.
+    # =====================================================================
     if payload.type == "GTCS":
         jerk_upgrade_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
+        seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
 
-        # FIX: removed end_time != None filter — open Jerk records must also be upgraded
+        # --- Scenario 1: live GTCS session open (created by /upload path) ---
+        # Look for any open GTCS OR a GTCS that closed within the last
+        # JERK_TO_GTCS_SECONDS seconds (race: base station event arrives
+        # just after the live path closed the session).
+        live_gtcs_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
+        live_gtcs = await database.fetch_one(
+            user_seizure_sessions.select()
+            .where(user_seizure_sessions.c.user_id == user_id)
+            .where(user_seizure_sessions.c.type == "GTCS")
+            .where(user_seizure_sessions.c.start_time >= start_utc - live_gtcs_window)
+            .where(
+                sqlalchemy.or_(
+                    user_seizure_sessions.c.end_time == None,
+                    user_seizure_sessions.c.end_time >= start_utc - live_gtcs_window
+                )
+            )
+            .order_by(user_seizure_sessions.c.start_time.desc())
+        )
+
+        if live_gtcs:
+            # Use the earlier start (live session may have started before base station start_utc)
+            best_start = min(live_gtcs["start_time"], start_utc)
+            best_end   = max(live_gtcs["end_time"] or end_utc, end_utc)
+            best_dur   = round((best_end - best_start).total_seconds(), 2)
+            print(f"[SEIZURE EVENT] Merging base-station GTCS into live session (id={live_gtcs['id']}) "
+                  f"best_dur={best_dur}s start={ts_pht_iso(best_start)} end={ts_pht_iso(best_end)}")
+            await database.execute(
+                user_seizure_sessions.update()
+                .where(user_seizure_sessions.c.id == live_gtcs["id"])
+                .values(
+                    start_time=best_start,
+                    end_time=best_end,
+                    duration_seconds=best_dur,
+                    seizing_devices=seizing_json,
+                )
+            )
+            # Absorb any Jerk records that overlap, so they don't show up separately
+            overlapping_jerks = await database.fetch_all(
+                user_seizure_sessions.select()
+                .where(user_seizure_sessions.c.user_id == user_id)
+                .where(user_seizure_sessions.c.type == "Jerk")
+                .where(user_seizure_sessions.c.start_time <= best_end + jerk_upgrade_window)
+                .where(
+                    sqlalchemy.or_(
+                        user_seizure_sessions.c.end_time == None,
+                        user_seizure_sessions.c.end_time >= best_start - jerk_upgrade_window
+                    )
+                )
+            )
+            for jerk in overlapping_jerks:
+                print(f"[SEIZURE EVENT] Deleting Jerk (id={jerk['id']}) absorbed into live GTCS")
+                await database.execute(
+                    user_seizure_sessions.delete()
+                    .where(user_seizure_sessions.c.id == jerk["id"])
+                )
+            return {
+                "status": "merged",
+                "event": "GTCS_merged_into_live",
+                "duration_seconds": best_dur,
+                "start_pht": ts_pht_iso(best_start),
+                "end_pht": ts_pht_iso(best_end),
+                "seizing_devices": payload.seizing_devices,
+            }
+
+        # --- Scenario 2: no live GTCS, but overlapping Jerk records exist ---
         overlapping_jerks = await database.fetch_all(
             user_seizure_sessions.select()
             .where(user_seizure_sessions.c.user_id == user_id)
@@ -989,9 +1065,8 @@ async def upload_seizure_event(payload: SeizureEventPayload):
             base_jerk = overlapping_jerks[0]
             combined_start = base_jerk["start_time"]
             combined_duration = round((end_utc - combined_start).total_seconds(), 2)
-            seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
 
-            print(f"[SEIZURE EVENT] Upgrading Jerk (id={base_jerk['id']}) → GTCS "
+            print(f"[SEIZURE EVENT] Upgrading Jerk (id={base_jerk['id']}) -> GTCS "
                   f"(combined_dur={combined_duration}s, absorbing {len(overlapping_jerks)} jerk(s))")
 
             await database.execute(
@@ -1006,9 +1081,8 @@ async def upload_seizure_event(payload: SeizureEventPayload):
                 )
             )
 
-            # Delete any extra absorbed Jerk records
             for extra_jerk in overlapping_jerks[1:]:
-                print(f"[SEIZURE EVENT] Deleting absorbed Jerk (id={extra_jerk['id']}) — part of GTCS")
+                print(f"[SEIZURE EVENT] Deleting absorbed Jerk (id={extra_jerk['id']}) - part of GTCS")
                 await database.execute(
                     user_seizure_sessions.delete()
                     .where(user_seizure_sessions.c.id == extra_jerk["id"])
@@ -1022,6 +1096,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
                 "end_pht": ts_pht_iso(end_utc),
                 "seizing_devices": payload.seizing_devices,
             }
+
 
     # Late-arriving Jerk suppression: if a GTCS already exists in the DB that
     # overlaps this Jerk's window, reject the Jerk entirely — it already escalated.
