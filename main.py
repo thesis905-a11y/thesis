@@ -138,7 +138,7 @@ GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 20.0   # 2+ devices, 20s sustained motion
 JERK_TO_GTCS_SECONDS                = 20.0   # jerk escalation to GTCS
 MIN_SEIZING_DEVICES_FOR_GTCS        = 2      # backend enforces 2+ device minimum
 
-SAME_TYPE_DEDUP_WINDOW_SECONDS      = 3
+SAME_TYPE_DEDUP_WINDOW_SECONDS      = 60   # widened: live path and base station may differ by >3s
 
 
 # =====================================================================
@@ -983,19 +983,22 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         seizing_json = json.dumps(payload.seizing_devices) if payload.seizing_devices else json.dumps(payload.device_ids)
 
         # --- Scenario 1: live GTCS session open (created by /upload path) ---
-        # Look for any open GTCS OR a GTCS that closed within the last
-        # JERK_TO_GTCS_SECONDS seconds (race: base station event arrives
-        # just after the live path closed the session).
-        live_gtcs_window = timedelta(seconds=JERK_TO_GTCS_SECONDS)
+        # Find any GTCS session for this user whose time range overlaps
+        # with the incoming event. We use a generous 120s window in both
+        # directions to handle:
+        #   - Live session started before base station start_utc
+        #   - Race condition where live session closed just before this arrived
+        #   - Clock skew between base station and server
+        overlap_window = timedelta(seconds=120)
         live_gtcs = await database.fetch_one(
             user_seizure_sessions.select()
             .where(user_seizure_sessions.c.user_id == user_id)
             .where(user_seizure_sessions.c.type == "GTCS")
-            .where(user_seizure_sessions.c.start_time >= start_utc - live_gtcs_window)
+            .where(user_seizure_sessions.c.start_time <= end_utc + overlap_window)
             .where(
                 sqlalchemy.or_(
                     user_seizure_sessions.c.end_time == None,
-                    user_seizure_sessions.c.end_time >= start_utc - live_gtcs_window
+                    user_seizure_sessions.c.end_time >= start_utc - overlap_window
                 )
             )
             .order_by(user_seizure_sessions.c.start_time.desc())
